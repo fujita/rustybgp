@@ -10,4 +10,5 @@ jobs:
       - uses: actions/checkout@master
       - name: build
         run: |
+          cd /home/runner/work/rustybgp/rustybgp
           docker build . -t rustybgp -f tests/integration/functional/Dockerfile
