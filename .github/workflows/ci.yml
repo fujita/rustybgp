@@ -1,0 +1,13 @@
+name: ci
+
+on: [pull_request]
+
+jobs:
+  build:
+    name: build container image
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@master
+      - name: build
+        run: |
+          docker build . -t rustybgp -f ~/Devel/git/rustybgp/tests/integration/functional/Dockerfile
