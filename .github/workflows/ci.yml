@@ -2,12 +2,19 @@ name: ci
 
 on: [pull_request]
 
+env:
+  IMAGE_NAME: rustybgp-ci
+
 jobs:
   build:
     name: build container image
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/checkout@master
+
+      - name: Login GitHub Registry
+        run: docker login docker.pkg.github.com -u owner -p ${{ secrets.GITHUB_TOKEN }}
+
       - name: build
         run: |
           sudo apt-get update
@@ -21,4 +28,7 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl
           curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
-          docker build . -t rustybgp-ci -f tests/integration/functional/docker/Dockerfile
+          docker build -t docker.pkg.github.com/${{ github.repository }}/${IMAGE_NAME}:${GITHUB_SHA} --file tests/integration/functional/docker/Dockerfile .
+
+      - name: Push image to GitHub Registry
+        run: docker push docker.pkg.github.com/${{ github.repository }}/${IMAGE_NAME}:${GITHUB_SHA}
