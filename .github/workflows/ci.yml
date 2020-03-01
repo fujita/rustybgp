@@ -45,8 +45,10 @@ jobs:
         run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
       - name: pull image
-        run: docker pull docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA}
+        run: |
+          docker pull docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA}
+          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
 
       - name: test
         run: |
-          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE}:${GITHUB_SHA} go test -run TestIbgp
+          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA} go test -run TestIbgp

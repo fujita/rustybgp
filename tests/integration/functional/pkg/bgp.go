@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
@@ -20,8 +21,23 @@ import (
 	api "github.com/osrg/gobgp/api"
 )
 
-const rustbgyImageEnv = "RUSTYBGP_IMAGE_NAME"
-const rustybgpImage = "rustybgp-ci"
+func rustyImageName() string {
+	const imageNameEnv = "RUSTYBGP_IMAGE_NAME"
+
+	if n := os.Getenv(imageNameEnv); n != "" {
+		return n
+	}
+	return "rustybgp-ci"
+}
+
+func gobgpImageName() string {
+	const imageNameEnv = "GOBGY_IMAGE_NAME"
+
+	if n := os.Getenv(imageNameEnv); n != "" {
+		return n
+	}
+	return "docker.pkg.github.com/fujita/gobgp/gobgp-daemon"
+}
 
 type peer struct {
 	id        string
