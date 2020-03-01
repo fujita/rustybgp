@@ -3,7 +3,7 @@ name: ci
 on: [pull_request]
 
 env:
-  IMAGE_NAME: rustybgp-ci
+  RUSTYBGP_IMAGE_NAME: rustybgp-ci:${GITHUB_SHA}
 
 jobs:
   build:
@@ -28,7 +28,23 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl
           curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
-          docker build -t docker.pkg.github.com/${{ github.repository }}/${IMAGE_NAME}:${GITHUB_SHA} --file tests/integration/functional/docker/Dockerfile .
+          docker build -t docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE_NAME} --file tests/integration/functional/docker/Dockerfile .
 
       - name: Push image to GitHub Registry
-        run: docker push docker.pkg.github.com/${{ github.repository }}/${IMAGE_NAME}:${GITHUB_SHA}
+        run: docker push docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE_NAME}
+
+  ibgp:
+    name: ibgp
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - name: Login GitHub Registry
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
+
+      - name: pull image
+        run: docker pull docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE_NAME}
+
+      - name: test
+        run: |
+          echo ${RUSTYBGP_IMAGE_NAME}
+          cd tests/integration/functional/pkg && go test -run TestIbgp
