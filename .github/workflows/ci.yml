@@ -39,6 +39,8 @@ jobs:
     runs-on: ubuntu-18.04
     needs: build
     steps:
+      - uses: actions/checkout@master
+
       - name: Login GitHub Registry
         run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
@@ -47,6 +49,4 @@ jobs:
 
       - name: test
         run: |
-          export RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE}:${GITHUB_SHA}
-          echo ${RUSTYBGP_IMAGE_NAME}
-          cd tests/integration/functional/pkg && go test -run TestIbgp
+          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE}:${GITHUB_SHA} go test -run TestIbgp

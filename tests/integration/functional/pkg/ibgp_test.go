@@ -1,6 +1,7 @@
 package bgptest
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -43,6 +44,7 @@ func TestIbgp(t *testing.T) {
 	if n := os.Getenv(rustbgyImageEnv); n != "" {
 		rustyimage = n
 	}
+	fmt.Println("image name ", rustyimage)
 	c, err := newBgpTest()
 	assert.Nil(t, err)
 	err = c.createPeer("ibgp-r1", rustyimage, 1)
