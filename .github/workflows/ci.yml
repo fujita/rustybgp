@@ -28,6 +28,7 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl
           curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
+          echo ${RUSTYBGP_IMAGE_NAME}
           docker build -t docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE_NAME} --file tests/integration/functional/docker/Dockerfile .
 
       - name: Push image to GitHub Registry
