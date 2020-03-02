@@ -14,7 +14,7 @@ func checkAdjout(t *testing.T, c *bgpTest) {
 	assert.Equal(t, r.received, uint64(0))
 	r, err = c.getCounter("g2", "r1")
 	assert.Nil(t, err)
-	assert.Equal(t, r.received, uint64(0))
+	assert.Equal(t, r.received, uint64(1))
 
 	has, _ := c.waitForPath("r1", adjout, "g2", "10.0.0.0/24", 50)
 	assert.False(t, has)
