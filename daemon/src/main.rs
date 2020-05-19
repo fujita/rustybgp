@@ -16,26 +16,30 @@
 use std::{
     collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant, HashMap, HashSet},
     convert::TryFrom,
-    fmt, io,
+    fmt,
+    hash::{Hash, Hasher},
+    io,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     str::FromStr,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, SystemTime},
 };
 
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    stream::StreamExt,
+    stream::{Stream, StreamExt},
     sync::{mpsc, Barrier, Mutex},
-    time::{delay_for, delay_queue, DelayQueue, Instant},
+    time::{delay_for, delay_queue, Delay, DelayQueue, Instant},
 };
 use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHasher};
 use futures::{FutureExt, SinkExt};
 use patricia_tree::PatriciaMap;
 use prost;
@@ -1648,7 +1652,7 @@ impl Table {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct MessageCounter {
     pub open: u64,
     pub update: u64,
@@ -2137,6 +2141,7 @@ pub struct Global {
     pub peer_group: HashMap<String, PeerGroup>,
 
     pub server_event_tx: Sender<SrvEvent>,
+    pub api_tx: Vec<Sender<FromApiEvent>>,
 }
 
 impl ToApi<api::Global> for Global {
@@ -2158,7 +2163,12 @@ impl ToApi<api::Global> for Global {
 }
 
 impl Global {
-    pub fn new(as_number: u32, id: Ipv4Addr, server_event_tx: Sender<SrvEvent>) -> Global {
+    pub fn new(
+        as_number: u32,
+        id: Ipv4Addr,
+        server_event_tx: Sender<SrvEvent>,
+        api_tx: Vec<Sender<FromApiEvent>>,
+    ) -> Global {
         Global {
             as_number,
             id,
@@ -2166,6 +2176,7 @@ impl Global {
             peers: HashMap::new(),
             peer_group: HashMap::new(),
             server_event_tx,
+            api_tx,
         }
     }
 }
@@ -2418,12 +2429,19 @@ impl GobgpApi for Service {
         let addr = IpAddr::from_str(&request.address);
 
         let (mut tx, rx) = mpsc::channel(1024);
-        let table = self.table.clone();
         let global = self.global.clone();
 
         tokio::spawn(async move {
-            let table = table.lock().await;
             let global = &mut global.lock().await;
+            let mut stats = HashMap::new();
+
+            for tx in &global.api_tx {
+                let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+                let _ = tx.send(FromApiEvent::ListPeer(api_tx));
+                while let Some(s) = api_rx.recv().await {
+                    stats.insert(s.remote_addr, s);
+                }
+            }
 
             for (a, p) in global.peers.iter_mut() {
                 if let Ok(addr) = addr {
@@ -2431,8 +2449,15 @@ impl GobgpApi for Service {
                         continue;
                     }
                 }
-                if let Some(s) = table.bgp_sessions.get(&a) {
-                    p.accepted = s.accepted.iter().map(|(k, v)| (*k, *v)).collect();
+                // FIX: update accepted
+                if let Some(s) = stats.remove(a) {
+                    p.state = s.state;
+                    p.remote_as = s.remote_as;
+                    p.router_id = s.remote_id;
+                    p.uptime = s.uptime;
+                    p.remote_cap = s.remote_cap;
+                    p.counter_rx = s.counter_rx;
+                    p.counter_tx = s.counter_tx;
                 }
 
                 let rsp = api::ListPeerResponse {
@@ -2836,16 +2861,16 @@ impl GobgpApi for Service {
 
         let mut nr_dst: u64 = 0;
         let mut nr_path: u64 = 0;
-        for (_, dst) in self
-            .table
-            .lock()
-            .await
-            .routing
-            .iter_destination(false, family)
-        {
-            nr_path += dst.entry.len() as u64;
-            nr_dst += 1;
+
+        for tx in &self.global.lock().await.api_tx {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+            let _ = tx.send(FromApiEvent::GetTable(family, api_tx));
+            if let Some(s) = api_rx.recv().await {
+                nr_dst += s.0;
+                nr_path += s.1;
+            }
         }
+
         Ok(tonic::Response::new(api::GetTableResponse {
             num_destination: nr_dst,
             num_path: nr_path,
@@ -3550,11 +3575,553 @@ async fn handle_table_update(
     }
 }
 
+pub struct PeerStats {
+    remote_addr: IpAddr,
+    remote_as: u32,
+    remote_id: Ipv4Addr,
+    state: bgp::State,
+    uptime: SystemTime,
+    remote_cap: Vec<bgp::Capability>,
+    counter_tx: MessageCounter,
+    counter_rx: MessageCounter,
+}
+
+pub enum FromApiEvent {
+    ListPeer(Sender<PeerStats>),
+    GetTable(bgp::Family, Sender<(u64, u64)>),
+}
+
+pub enum SessionEvent {
+    Message(IpAddr, bgp::Message),
+    Holdtimer(IpAddr),
+}
+
+pub struct Session {
+    lines: Framed<TcpStream, Bgp>,
+    // tx future
+    source: Arc<Source>,
+    accepted: HashMap<bgp::Family, u64>,
+    // // enabled families
+    families: HashSet<bgp::Family>,
+
+    local_cap: Vec<bgp::Capability>,
+
+    remote_as: u32,
+    remote_id: Ipv4Addr,
+    state: bgp::State,
+    uptime: SystemTime,
+    remote_cap: Vec<bgp::Capability>,
+    keepalive_interval: u64,
+
+    pub counter_tx: MessageCounter,
+    pub counter_rx: MessageCounter,
+
+    sync: bool,
+    sync_set: HashSet<usize>,
+    init_update: Vec<RoutingTableUpdate>,
+    pending: Vec<RoutingTableUpdate>,
+}
+
+impl Session {
+    pub fn new(
+        stream: TcpStream,
+        source: Arc<Source>,
+        remote_as: u32,
+        local_cap: Vec<bgp::Capability>,
+    ) -> Self {
+        Session {
+            lines: Framed::new(
+                stream,
+                Bgp {
+                    param: bgp::ParseParam { local_as: 1 },
+                },
+            ),
+            accepted: HashMap::new(),
+            families: HashSet::new(),
+            source,
+            remote_as,
+            remote_id: Ipv4Addr::new(0, 0, 0, 0),
+            state: bgp::State::Active,
+            uptime: SystemTime::UNIX_EPOCH,
+            remote_cap: Vec::new(),
+            local_cap,
+            keepalive_interval: (bgp::OpenMessage::HOLDTIME / 3) as u64,
+            counter_tx: Default::default(),
+            counter_rx: Default::default(),
+            sync: false,
+            sync_set: HashSet::new(),
+            init_update: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn to_stats(&self, addr: IpAddr) -> PeerStats {
+        PeerStats {
+            remote_addr: addr,
+            remote_as: self.remote_as,
+            remote_id: self.remote_id,
+            state: self.state,
+            uptime: self.uptime,
+            remote_cap: self.remote_cap.iter().cloned().collect(),
+            counter_tx: self.counter_tx,
+            counter_rx: self.counter_rx,
+        }
+    }
+
+    pub async fn send_msg(&mut self, msg: bgp::Message) -> Result<(), io::Error> {
+        self.counter_tx.sync(&msg);
+        self.lines.send(msg).await
+    }
+
+    pub async fn send_update(&mut self, idx: usize, rtu: &RoutingTableUpdate) {
+        if self.state != bgp::State::Established {
+            return;
+        }
+        if !self.sync {
+            if self.sync_set.contains(&idx) {
+                self.pending.push(rtu.clone());
+            }
+            return;
+        }
+        if !need_to_advertise(&rtu.source, &self.source, rtu.family, &self.families) {
+            return;
+        }
+        match send_update(self.source.clone(), &mut self.lines, vec![rtu.clone()]).await {
+            Ok((update, prefix)) => {
+                self.counter_tx.update += 1;
+                self.counter_tx.total += 1;
+                self.counter_tx.withdraw_update += update;
+                self.counter_tx.withdraw_prefix += prefix;
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+pub enum Itc {
+    Update(usize, RoutingTableUpdate),
+    Pass(RoutingTableUpdate),
+    InitRequest(usize, IpAddr, Vec<bgp::Family>),
+    InitResponse(usize, IpAddr, Vec<RoutingTableUpdate>),
+}
+
+pub struct BgpServe {
+    idx: usize,
+    mask: usize,
+    sessions: HashMap<IpAddr, Session>,
+    expirations: DelayQueue<IpAddr>,
+
+    routing: RoutingTable,
+    tbl_tx: Vec<Sender<Itc>>,
+}
+
+impl Stream for BgpServe {
+    type Item = Result<SessionEvent, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(Some(Ok(v))) = Pin::new(&mut self.expirations).poll_expired(cx) {
+            let addr = v.into_inner();
+            return Poll::Ready(Some(Ok(SessionEvent::Holdtimer(addr))));
+        }
+
+        // if let Poll::Ready(Some(v)) = Pin::new(&mut self.rx).poll_next(cx) {
+        //     let (s, caps) = v;
+        //     return Poll::Ready(Some(Ok(SessionEvent::NewPeer(s, caps))));
+        // }
+
+        for (addr, s) in &mut self.sessions {
+            if let Poll::Ready(e) = Pin::new(&mut s.lines).poll_next(cx) {
+                match e {
+                    Some(Ok(message)) => {
+                        return Poll::Ready(Some(Ok(SessionEvent::Message(*addr, message))));
+                    }
+                    Some(Err(e)) => {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    None => {}
+                }
+            }
+        }
+        Poll::Pending
+    }
+}
+
+fn nlri_to_idx(mask: usize, nlri: bgp::Nlri) -> usize {
+    let mut hasher = FnvHasher::default();
+    nlri.hash(&mut hasher);
+    (hasher.finish() & mask as u64) as usize
+}
+
+impl BgpServe {
+    pub fn new(idx: usize, order: usize, tbl_tx: Vec<Sender<Itc>>) -> Self {
+        BgpServe {
+            idx,
+            mask: (1 << order) - 1,
+            sessions: HashMap::new(),
+            expirations: DelayQueue::new(),
+            routing: RoutingTable::new(false),
+            tbl_tx,
+        }
+    }
+
+    pub async fn add_session(
+        &mut self,
+        router_id: Ipv4Addr,
+        stream: TcpStream,
+        local_as: u32,
+        remote_as: u32,
+        caps: Vec<bgp::Capability>,
+    ) {
+        if let Ok(peer_addr) = stream.peer_addr() {
+            if let Ok(local_addr) = stream.local_addr() {
+                let mut session = Session::new(
+                    stream,
+                    Arc::new(Source {
+                        local_addr: local_addr.to_ipaddr(),
+                        local_as,
+                        address: peer_addr.to_ipaddr(),
+                        ibgp: false,
+                        state: bgp::State::Active,
+                    }),
+                    remote_as,
+                    caps.iter().cloned().collect(),
+                );
+                // don't use await
+                println!("send open");
+                if session
+                    .send_msg(bgp::Message::Open(bgp::OpenMessage::new(router_id, caps)))
+                    .await
+                    .is_err()
+                {
+                } else {
+                    self.sessions.insert(peer_addr.to_ipaddr(), session);
+                }
+            }
+        }
+    }
+
+    pub async fn handle_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Holdtimer(addr) => {
+                println!("holdtimer {}", addr);
+                if let Some(session) = self.sessions.get_mut(&addr) {
+                    let _ = session.send_msg(bgp::Message::Keepalive).await;
+                    self.expirations
+                        .insert(addr, Duration::from_secs(session.keepalive_interval));
+                }
+            }
+            SessionEvent::Message(addr, msg) => {
+                let mut send = Vec::new();
+                if let Some(session) = self.sessions.get_mut(&addr) {
+                    session.counter_rx.sync(&msg);
+                    match msg {
+                        bgp::Message::Open(open) => {
+                            let remote_as = open.get_as_number();
+                            if session.remote_as != 0 && session.remote_as != remote_as {
+                                session.state = bgp::State::Idle;
+                                let _ = session
+                                    .send_msg(bgp::Message::Notification(
+                                        bgp::NotificationMessage::new(
+                                            bgp::NotificationCode::OpenMessageBadPeerAs,
+                                        ),
+                                    ))
+                                    .await;
+                                // todo: delete session
+                            }
+                            session.remote_as = remote_as;
+                            session.remote_id = open.id;
+                            println!("got open {}", addr);
+
+                            session.remote_cap = open
+                                .params
+                                .into_iter()
+                                .filter_map(|p| match p {
+                                    bgp::OpenParam::CapabilityParam(c) => Some(c),
+                                    _ => None,
+                                })
+                                .collect();
+                            let remote_families: HashSet<_> = session
+                                .remote_cap
+                                .iter()
+                                .filter_map(|c| match c {
+                                    bgp::Capability::MultiProtocol { family } => Some(family),
+                                    _ => None,
+                                })
+                                .collect();
+
+                            session.families = session
+                                .local_cap
+                                .iter()
+                                .filter_map(|c| match c {
+                                    bgp::Capability::MultiProtocol { family } => Some(family),
+                                    _ => None,
+                                })
+                                .filter_map(|f| {
+                                    if remote_families.contains(&f) {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            session.state = bgp::State::OpenConfirm;
+
+                            let interval = (open.holdtime / 3) as u64;
+                            if interval < session.keepalive_interval {
+                                session.keepalive_interval = interval;
+                            }
+
+                            // FIXME: don't use await
+                            if session.send_msg(bgp::Message::Keepalive).await.is_err() {
+                                // remove session
+                            }
+                        }
+                        bgp::Message::Update(update) => {
+                            if !update.attrs.is_empty() {
+                                let pa = Arc::new(PathAttr {
+                                    entry: update.attrs,
+                                });
+
+                                for nlri in update.routes {
+                                    let idx = nlri_to_idx(self.mask, nlri);
+                                    if self.idx == idx {
+                                        println!("handle myself {} {:?}", idx, nlri);
+                                        let (u, added) = self.routing.insert(
+                                            bgp::Family::Ipv4Uc,
+                                            nlri,
+                                            session.source.clone(),
+                                            update.nexthop,
+                                            pa.clone(),
+                                        );
+                                        if let Some(u) = u {
+                                            // send our peers and others
+                                            for i in 0..self.tbl_tx.len() {
+                                                if i != self.idx {
+                                                    let _ = self.tbl_tx[i]
+                                                        .send(Itc::Update(self.idx, u.clone()));
+                                                }
+                                            }
+                                            send.push(u);
+                                        }
+                                        if added {}
+                                    } else {
+                                        println!("handle {} send to {}", self.idx, idx);
+                                        let u = RoutingTableUpdate::new(
+                                            session.source.clone(),
+                                            bgp::Family::Ipv4Uc,
+                                            nlri,
+                                            Some(pa.clone()),
+                                            Some(update.nexthop),
+                                        );
+                                        let _ = self.tbl_tx[idx].send(Itc::Pass(u));
+                                    }
+                                }
+
+                                // if let Some((family, mp_routes, nexthop)) = update.mp_routes {
+                                //     for nlri in mp_routes {
+                                //         let _ = table_tx.send(FromPeerEvent::Update(
+                                //             RoutingTableUpdate::new(
+                                //                 source.clone(),
+                                //                 family,
+                                //                 nlri,
+                                //                 Some(pa.clone()),
+                                //                 Some(nexthop),
+                                //             ),
+                                //         ));
+                                //     }
+                                // }
+                            }
+
+                            // for (family, nlri) in update.withdrawns {
+                            //     let _ =
+                            //         table_tx.send(FromPeerEvent::Update(RoutingTableUpdate::new(
+                            //             source.clone(),
+                            //             family,
+                            //             nlri,
+                            //             None,
+                            //             None,
+                            //         )));
+                            // }
+                        }
+                        bgp::Message::Notification(_) => {
+                            // break;
+                        }
+                        bgp::Message::Keepalive => {
+                            if session.state != bgp::State::Established {
+                                session.state = bgp::State::Established;
+                                session.uptime = SystemTime::now();
+                                session.source = Arc::new(Source {
+                                    local_addr: session.source.local_addr,
+                                    local_as: session.source.local_as,
+                                    address: session.source.address,
+                                    ibgp: session.source.local_as == session.remote_as,
+                                    state: bgp::State::Established,
+                                });
+                                if self.mask == 0 {
+                                    session.sync = true;
+                                } else {
+                                    println!("peer {} on {}", session.source.address, self.idx);
+                                    session.sync_set.insert(self.idx);
+                                    for i in 0..self.tbl_tx.len() {
+                                        if i != self.idx {
+                                            let families: Vec<bgp::Family> =
+                                                session.families.iter().cloned().collect();
+                                            let _ = self.tbl_tx[i]
+                                                .send(Itc::InitRequest(self.idx, addr, families));
+                                        }
+                                    }
+                                }
+                                let families: Vec<bgp::Family> =
+                                    session.families.iter().cloned().collect();
+                                //routing.disable_best_path_selection
+                                for family in families {
+                                    for route in self.routing.iter_destination(false, family) {
+                                        session.init_update.push(RoutingTableUpdate::new(
+                                            route.1.entry[0].source.clone(),
+                                            family,
+                                            *route.0,
+                                            Some(route.1.entry[0].attrs.clone()),
+                                            Some(route.1.entry[0].nexthop),
+                                        ));
+                                    }
+                                }
+                                self.expirations
+                                    .insert(addr, Duration::from_secs(session.keepalive_interval));
+                            }
+                        }
+                        bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
+                        bgp::Message::Unknown { code, .. } => {
+                            println!("unknown message type {}", code)
+                        }
+                    }
+                }
+                for (a, sess) in &mut self.sessions {
+                    if a != &addr {
+                        for rtu in &send {
+                            sess.send_update(self.idx, rtu).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn serve(
+        &mut self,
+        rx: &mut Receiver<(Ipv4Addr, TcpStream, u32, u32, Vec<bgp::Capability>)>,
+        api: &mut Receiver<FromApiEvent>,
+        tbl_rx: &mut Receiver<Itc>,
+    ) {
+        loop {
+            tokio::select! {
+                Some(msg) = rx.next().fuse() => {
+                    let (router_id, stream, local_as, remote_as, caps) = msg;
+                    self.add_session(router_id, stream, local_as, remote_as, caps).await;
+                }
+                Some(msg) = tbl_rx.next().fuse() => {
+                    match msg {
+                        Itc::Pass(m) => {
+                            println!("got passing {} {:?}", self.idx, m.nlri);
+                            let (u, added) = self.routing.insert(
+                                bgp::Family::Ipv4Uc,
+                                m.nlri,
+                                m.source.clone(),
+                                m.nexthop.unwrap(),
+                                m.attrs.unwrap(),
+                            );
+                            if let Some(u) = u {
+                                for i in 0..self.tbl_tx.len() {
+                                    if i != self.idx {
+                                        let _ = self.tbl_tx[i].send(Itc::Update(self.idx, u.clone()));
+                                    }
+                                }
+                                for (_, sess) in &mut self.sessions {
+                                    sess.send_update(self.idx, &u).await;
+                                    // if need_to_advertise(&u.source, &sess.source, u.family, &sess.families) {
+                                    //     let _ = send_update(sess.source.clone(), &mut sess.lines, vec![u.clone()]).await;
+                                    // }
+                                }
+                            }
+                        }
+                        Itc::Update(idx, rtu) => {
+                            for (_, sess) in &mut self.sessions {
+                                sess.send_update(idx, &rtu).await;
+                            }
+                        }
+                        Itc::InitRequest(idx, addr, families) => {
+                            println!("init req {} {} {}", self.idx, idx, addr);
+                            let mut v = Vec::new();
+                            for family in families {
+                                for route in self.routing.iter_destination(false, family) {
+                                    v.push(RoutingTableUpdate::new(
+                                        route.1.entry[0].source.clone(),
+                                        family,
+                                        *route.0,
+                                        Some(route.1.entry[0].attrs.clone()),
+                                        Some(route.1.entry[0].nexthop),
+                                    ));
+                                }
+                            }
+                            let _ = self.tbl_tx[idx].send(Itc::InitResponse(self.idx, addr, v));
+                        }
+                        Itc::InitResponse(idx, addr, mut rtus) => {
+                            println!("init rsp {} {} {}", self.idx, idx, addr);
+                            if let Some(sess) = self.sessions.get_mut(&addr) {
+                                sess.init_update.append(&mut rtus);
+                                sess.sync_set.insert(idx);
+                                println!("rsp {} {}", sess.sync_set.len(), self.mask+1);
+                                if sess.sync_set.len() == self.mask + 1 {
+                                    sess.sync = true;
+                                    sess.sync_set = HashSet::new();
+                                    sess.init_update.append(&mut sess.pending);
+                                    let v:Vec<RoutingTableUpdate> = sess.init_update.drain(..).collect();
+                                    for rtu in v {
+                                        sess.send_update(self.idx, &rtu).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Ok(msg)) = self.next().fuse() => {
+                    self.handle_event(msg).await;
+                }
+                Some(msg) = api.next().fuse() => {
+                    match msg {
+                        FromApiEvent::ListPeer(tx) => {
+                            for (addr, sess) in &self.sessions {
+                                let _ = tx.send(sess.to_stats(*addr));
+                            }
+                        }
+                        FromApiEvent::GetTable(family, tx) => {
+                            let mut nr_path = 0;
+                            let mut nr_dst = 0;
+                            for (_,dst) in self.routing.iter_destination(false, family) {
+                                nr_dst +=1;
+                                nr_path += dst.entry.len() as u64;
+                            }
+                            let _ = tx.send((nr_dst, nr_path));
+                        }
+                    }
+                }
+            }
+            // if let Some(Ok(msg)) = self.next().await {
+            //     self.sessions.handle_event(msg, &mut self.expirations).await;
+            // }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Hello, RustyBGP!");
-
     let args = App::new("rustybgp")
+        .arg(
+            Arg::with_name("threads")
+                .long("threads")
+                .takes_value(true)
+                .help("specify as number"),
+        )
         .arg(
             Arg::with_name("asn")
                 .long("as-number")
@@ -3579,6 +4146,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
+    let thread_order: usize = if let Some(threads) = args.value_of("threads") {
+        let v: u32 = threads.parse()?;
+        31 - v.leading_zeros() as usize
+    } else {
+        1
+    };
+    let nr_thread: usize = 1 << thread_order;
+
     let asn = if let Some(asn) = args.value_of("asn") {
         asn.parse()?
     } else {
@@ -3590,9 +4165,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ipv4Addr::new(0, 0, 0, 0)
     };
 
+    println!("Hello, RustyBGP ({} threads)!", nr_thread);
+
+    let mut api_txs = Vec::new();
+    let mut srv_txs = Vec::new();
+    let mut tbl_txs = Vec::new();
+    let mut tbl_rxs = Vec::new();
+
     let (srv_event_tx, mut srv_event_rx) = mpsc::unbounded_channel();
 
-    let global = Arc::new(Mutex::new(Global::new(asn, router_id, srv_event_tx)));
+    for i in 0..nr_thread {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tbl_txs.push(tx);
+        tbl_rxs.push(rx);
+    }
+
+    for i in 0..nr_thread {
+        let (serve_tx, mut serve_rx) = mpsc::unbounded_channel();
+        srv_txs.push(serve_tx);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        api_txs.push(tx);
+        let mut tbl_rx = tbl_rxs.remove(0);
+        {
+            let mut b = BgpServe::new(i, thread_order, tbl_txs.iter().cloned().collect());
+            tokio::spawn(async move {
+                b.serve(&mut serve_rx, &mut rx, &mut tbl_rx).await;
+            });
+        }
+    }
+
+    let global = Arc::new(Mutex::new(Global::new(
+        asn,
+        router_id,
+        srv_event_tx,
+        api_txs,
+    )));
     if args.is_present("any") {
         let mut global = global.lock().await;
         global.peer_group.insert(
@@ -3634,6 +4241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (table_tx, mut table_rx) = mpsc::unbounded_channel();
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
     let mut incoming = listener.incoming();
+    let mut which_thread = 0;
     loop {
         let (proto, stream, sock) = tokio::select! {
             Some(stream) = incoming.next().fuse() => {
@@ -3882,10 +4490,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .insert(addr, BgpSession::new(tx, source.clone()));
             rx
         };
-        let table_tx = table_tx.clone();
-        tokio::spawn(async move {
-            handle_bgp_session(global, table, table_tx, &mut rx, stream, sock, local_addr).await;
-        });
+
+        {
+            let peer = g.peers.get(&addr).unwrap();
+            let caps = peer.local_cap.to_vec();
+
+            println!("send stream to {}!", which_thread);
+            let _ = srv_txs[which_thread].send((g.id, stream, peer.local_as, peer.remote_as, caps));
+            which_thread = (which_thread + 1) % nr_thread;
+        }
     }
 }
 
