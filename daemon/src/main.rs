@@ -16,17 +16,19 @@
 use std::{
     collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant, HashMap, HashSet},
     convert::TryFrom,
-    fmt, io,
+    env, fmt, fs, io,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     str::FromStr,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, SystemTime},
 };
 
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     stream::StreamExt,
     sync::{mpsc, Barrier, Mutex},
     time::{delay_for, delay_queue, DelayQueue, Instant},
@@ -36,9 +38,11 @@ use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
 use fnv::FnvHashMap;
+use futures::ready;
 use futures::{FutureExt, SinkExt};
 use patricia_tree::PatriciaMap;
 use prost;
+use quinn;
 use regex::Regex;
 
 mod api {
@@ -3554,6 +3558,16 @@ async fn handle_table_update(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, RustyBGP!");
 
+    let (cert, key) = {
+        let path = env::current_dir()?;
+        let cert_path = path.join("tests/cert.der");
+        let key_path = path.join("tests/key.der");
+        let (cert, key) = fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?)))?;
+        let cert = quinn::Certificate::from_der(&cert)?;
+        let key = quinn::PrivateKey::from_der(&key)?;
+        (cert, key)
+    };
+
     let args = App::new("rustybgp")
         .arg(
             Arg::with_name("asn")
@@ -3627,60 +3641,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if asn == 0 {
         init_tx.wait().await;
     }
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(Duration::from_secs(3600)))
+        .unwrap();
 
-    let mut listener =
-        TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
+    let mut server_config = quinn::ServerConfigBuilder::default();
+    server_config
+        .certificate(quinn::CertificateChain::from_certs(vec![cert.clone()]), key)
+        .unwrap();
+
+    let mut server_config = server_config.build();
+    server_config.transport = Arc::new(transport);
+    let mut endpoint = quinn::EndpointBuilder::default();
+    endpoint.listen(server_config);
+    let mut incoming = {
+        let (_endpoint, incoming) = endpoint.bind(&SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            global.lock().await.listen_port,
+        ))?;
+        incoming
+    };
 
     let (table_tx, mut table_rx) = mpsc::unbounded_channel();
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
-    let mut incoming = listener.incoming();
     loop {
-        let (proto, stream, sock) = tokio::select! {
-            Some(stream) = incoming.next().fuse() => {
-                match stream {
-                    Ok(stream) =>{
-                        match stream.peer_addr() {
-                            Ok(sock) => {
-                                let t = table.lock().await;
-                                if t.bgp_sessions.contains_key(&sock.to_ipaddr()) {
-                                    // already connected
-                                    continue;
-                                }
-                                (Proto::Bgp, stream, sock)
-                            },
-                            Err(_) => continue,
-                        }
-                    }
-                    Err(_) =>continue,
+        let (proto, stream, sock, quic_conn) = tokio::select! {
+            Some(connecting) = incoming.next().fuse() => {
+                let sock = connecting.remote_address();
+                let t = table.lock().await;
+                if t.bgp_sessions.contains_key(&sock.to_ipaddr()) {
+                        // already connected
+                    continue;
                 }
+                println!("accpeted new quic conn {:?}", sock);
+                (Proto::Bgp, None, sock, Some((connecting, false)))
             }
             Some(msg) = table_rx.next().fuse() => {
                 handle_table_update(global.clone(), table.clone(), msg, &mut expirations).await;
                 continue;
             }
             Some(v) = expirations.next().fuse() => {
-                    match v {
-                        Ok(v)=>{
-                            let (proto, sockaddr) = v.into_inner();
-                            let t = table.lock().await;
-                            if proto == Proto::Bgp && t.bgp_sessions.contains_key(&sockaddr.to_ipaddr()) {
+                match v {
+                    Ok(v)=>{
+                        let (proto, sockaddr) = v.into_inner();
+                        let t = table.lock().await;
+                        match proto {
+                            Proto::Bgp => {
+                                if t.bgp_sessions.contains_key(&sockaddr.to_ipaddr()) {
                                     // already connected
                                     continue;
-                            }
-                            match TcpStream::connect(sockaddr).await {
-                                Ok(stream) => (proto, stream, sockaddr),
-                                Err(_) => {
+                                }
+                                let mut endpoint = quinn::Endpoint::builder();
+                                let mut client_config = quinn::ClientConfigBuilder::default();
+                                client_config
+                                .add_certificate_authority(cert.clone())
+                                .unwrap();
+                                let mut client_config = client_config.build();
+                                let mut transport = quinn::TransportConfig::default();
+                                transport
+                                    .max_idle_timeout(Some(Duration::from_secs(3600)))
+                                    .unwrap();
+                                client_config.transport = Arc::new(transport);
+                                endpoint.default_client_config(client_config);
+                                let (endpoint, _) = endpoint.bind(&"0.0.0.0:0".parse().unwrap()).unwrap();
+                                if let Ok(new_conn) = endpoint.connect(&sockaddr, "localhost") {
+                                    println!("active quic conn {:?}", sockaddr);
+                                    (Proto::Bgp, None, sockaddr, Some((new_conn, true)))
+                                } else {
                                     let _ = global.lock().await.server_event_tx.send(
                                         SrvEvent::EnableActive{proto, sockaddr}
                                     );
                                     continue;
                                 }
                             }
-                        }
-                        Err(_)=>{
-                            continue;
+                            _ => {
+                                match TcpStream::connect(sockaddr).await {
+                                    Ok(stream) => (proto, Some(stream), sockaddr, None),
+                                    Err(_) => {
+                                        let _ = global.lock().await.server_event_tx.send(
+                                            SrvEvent::EnableActive{proto, sockaddr}
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
+                    Err(_)=>{
+                        continue;
+                    }
+                }
             }
             Some(event) = srv_event_rx.next().fuse() =>{
                 match event {
@@ -3746,14 +3797,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let addr = sock.to_ipaddr();
-        println!("got new connection {:?} {:?}", proto, addr);
-
-        let local_addr = match stream.local_addr() {
-            Ok(addr) => addr.to_ipaddr(),
-            Err(_) => {
-                continue;
-            }
-        };
 
         if proto == Proto::Bmp {
             let global = global.clone();
@@ -3806,10 +3849,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             t.bmp_sessions.insert(sock, tx);
             let table_tx = table_tx.clone();
             tokio::spawn(async move {
-                handle_bmp_session(table_tx, &mut rx, stream, sock).await;
+                handle_bmp_session(table_tx, &mut rx, stream.unwrap(), sock).await;
             });
             continue;
         } else if proto == Proto::Rtr {
+            let stream = stream.unwrap();
             let table = Arc::clone(&table);
             {
                 let mut t = table.lock().await;
@@ -3865,6 +3909,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .delete_on_disconnected(true);
             g.peers.insert(addr, peer);
         }
+        let local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
         let global = Arc::clone(&global);
         let table = Arc::clone(&table);
@@ -3883,8 +3928,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rx
         };
         let table_tx = table_tx.clone();
+        let quic_conn = quic_conn.unwrap();
         tokio::spawn(async move {
-            handle_bgp_session(global, table, table_tx, &mut rx, stream, sock, local_addr).await;
+            handle_bgp_session(
+                global,
+                table,
+                table_tx,
+                &mut rx,
+                quic_conn.0,
+                sock,
+                local_addr,
+                quic_conn.1,
+            )
+            .await;
         });
     }
 }
@@ -4094,7 +4150,7 @@ impl BgpSession {
 
 async fn send_update(
     to: Arc<Source>,
-    lines: &mut Framed<TcpStream, Bgp>,
+    lines: &mut Framed<QuicStream, Bgp>,
     updates: Vec<RoutingTableUpdate>,
 ) -> Result<(u64, u64), io::Error> {
     let mut withdraw = 0;
@@ -4129,15 +4185,68 @@ async fn send_update(
     Ok((withdraw, withdraw))
 }
 
+pub struct QuicStream {
+    s: quinn::SendStream,
+    r: quinn::RecvStream,
+}
+
+impl tokio::io::AsyncRead for QuicStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(
+            match ready!(quinn::RecvStream::poll_read(&mut self.get_mut().r, cx, buf))? {
+                Some(n) => n,
+                None => 0,
+            },
+        ))
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        quinn::SendStream::poll_write(&mut self.get_mut().s, cx, buf).map_err(Into::into)
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        quinn::SendStream::poll_finish(&mut self.get_mut().s, cx).map_err(Into::into)
+    }
+}
+
 async fn handle_bgp_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
     table_tx: Sender<FromPeerEvent>,
     peer_event_rx: &mut Receiver<ToPeerEvent>,
-    stream: TcpStream,
+    handshake: quinn::Connecting,
     sock: SocketAddr,
     local_addr: IpAddr,
+    active: bool,
 ) {
+    let stream = if active {
+        let quinn::NewConnection {
+            connection: conn, ..
+        } = { handshake.await.unwrap() };
+        let (s, r) = conn.open_bi().await.unwrap();
+        QuicStream { s, r }
+    } else {
+        let quinn::NewConnection { mut bi_streams, .. } = handshake.await.unwrap();
+        let quic_stream = bi_streams.next().await.unwrap().unwrap();
+        QuicStream {
+            s: quic_stream.0,
+            r: quic_stream.1,
+        }
+    };
+
     let (as_number, router_id) = {
         let global = global.lock().await;
         (global.as_number, global.id)

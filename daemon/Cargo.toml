@@ -19,6 +19,8 @@ futures = "0.3"
 patricia_tree = "0.1"
 regex = "1"
 fnv = "1.0"
+quinn = {git = "https://github.com/fujita/quinn.git",rev="f033275415617824fedb29bc459697919e11cf42"}
+rcgen = "0.8"
 
 proto = { path = "../proto" }
 
