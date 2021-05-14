@@ -24,6 +24,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::ops::Deref;
+use std::path::Path;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,6 +33,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
+use wasmer::{Instance, Module, Store, Value};
+use wasmer_wasi::WasiState;
 
 use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
@@ -1761,11 +1764,18 @@ struct Table {
     sessions: FnvHashMap<IpAddr, Session>,
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
     global_export_policy: Option<Arc<table::PolicyAssignment>>,
+    wasm_instance: Instance,
 }
 
 static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
+    let path = Path::new("./target/wasm32-wasi/debug/policy-plugin.wasm");
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
+        let store = Store::default();
+        let module = Module::from_file(&store, path).unwrap();
+        let mut wasi_env = WasiState::new("rustybgpd").args(&[""]).finalize().unwrap();
+        let import_object = wasi_env.import_object(&module).unwrap();
+        let instance = Instance::new(&module, &import_object).unwrap();
         table.push(Mutex::new(Table {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
@@ -1773,6 +1783,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             sessions: FnvHashMap::default(),
             global_import_policy: None,
             global_export_policy: None,
+            wasm_instance: instance,
         }));
     }
     table
@@ -1892,13 +1903,30 @@ async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<Tabl
                             if let Some(ri) =
                                 t.rtable.insert(source.clone(), family, net, attrs.clone())
                             {
-                                if let Some(a) = t.global_export_policy.as_ref() {
-                                    if t.rtable.apply_policy(a, &source, &net, &attrs)
-                                        == table::Disposition::Reject
-                                    {
-                                        continue;
+                                if let Some(a) = ri
+                                    .attr
+                                    .clone()
+                                    .iter()
+                                    .find(|a| a.code() == packet::Attribute::AS_PATH)
+                                {
+                                    let bin = a.binary().unwrap();
+                                    let mem = t.wasm_instance.exports.get_memory("memory").unwrap();
+                                    let ptr = mem.data_ptr();
+                                    unsafe {
+                                        for i in 0..bin.len() as isize {
+                                            *ptr.offset(i) = bin[i as usize];
+                                        }
+                                    }
+                                    let apply =
+                                        t.wasm_instance.exports.get_function("apply").unwrap();
+                                    let args = [Value::I32(0), Value::I32(bin.len() as i32)];
+                                    if let Ok(r) = apply.call(&args) {
+                                        if r[0] != Value::I32(0) {
+                                            continue;
+                                        }
                                     }
                                 }
+
                                 for c in t.peer_event_tx.values() {
                                     let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
                                 }
