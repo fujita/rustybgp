@@ -15,12 +15,13 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use once_cell::sync::Lazy;
 use std::boxed::Box;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
@@ -1052,10 +1053,11 @@ impl GoBgpService for GrpcService {
         let (bmp_tx, bmp_rx) = mpsc::unbounded_channel();
 
         if let Some(sockaddr) = request.remote_addr() {
-            for i in 0..*NUM_TABLES {
-                let mut t = TABLE[i].lock().await;
-                t.bmp_event_tx.insert(sockaddr, bmp_tx.clone());
-            }
+            GLOBAL_BMP_EVENT_TX.rcu(|old| {
+                let mut map = (**old).clone();
+                map.insert(sockaddr, bmp_tx.clone());
+                map
+            });
 
             let (tx, rx) = mpsc::channel(1024);
             tokio::spawn(async move {
@@ -1139,10 +1141,11 @@ impl GoBgpService for GrpcService {
                         _ => {}
                     }
                 }
-                for i in 0..*NUM_TABLES {
-                    let mut t = TABLE[i].lock().await;
-                    t.bmp_event_tx.remove(&sockaddr);
-                }
+                GLOBAL_BMP_EVENT_TX.rcu(|old| {
+                    let mut map = (**old).clone();
+                    map.remove(&sockaddr);
+                    map
+                });
             });
             Ok(tonic::Response::new(Box::pin(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -2088,10 +2091,14 @@ impl BmpClient {
             .await;
 
         let (tx, rx) = mpsc::unbounded_channel();
+        GLOBAL_BMP_EVENT_TX.rcu(|old| {
+            let mut map = (**old).clone();
+            map.insert(sockaddr, tx.clone());
+            map
+        });
         let mut adjin = FnvHashMap::default();
         for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
-            t.bmp_event_tx.insert(sockaddr, tx.clone());
+            let t = TABLE[i].lock().await;
             for f in &[Family::IPV4, Family::IPV6] {
                 for c in t.rtable.iter_reach(*f) {
                     let e = adjin.entry(c.source.remote_addr).or_insert_with(Vec::new);
@@ -2208,10 +2215,11 @@ impl BmpClient {
                 }
             }
         }
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
-            let _ = t.bmp_event_tx.remove(&sockaddr);
-        }
+        GLOBAL_BMP_EVENT_TX.rcu(|old| {
+            let mut map = (**old).clone();
+            map.remove(&sockaddr);
+            map
+        });
     }
 
     fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
@@ -2512,6 +2520,9 @@ static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
 static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
+static GLOBAL_BMP_EVENT_TX: Lazy<
+    ArcSwap<HashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>>,
+> = Lazy::new(|| ArcSwap::from_pointee(HashMap::new()));
 static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
@@ -2519,7 +2530,6 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
             table_event_tx: Vec::new(),
-            bmp_event_tx: FnvHashMap::default(),
             mrt_event_tx: None,
             addpath: FnvHashMap::default(),
         }));
@@ -3026,7 +3036,6 @@ struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
-    bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
@@ -3046,7 +3055,8 @@ impl Table {
                     TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
                         Some(attrs) => {
                             let mut t = TABLE[idx].lock().await;
-                            for bmp_tx in t.bmp_event_tx.values() {
+                            let bmp_event_tx = GLOBAL_BMP_EVENT_TX.load();
+                            for bmp_tx in bmp_event_tx.values() {
                                 let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
                                     e.contains(&family)
                                 } else {
@@ -3135,7 +3145,8 @@ impl Table {
                         }
                         None => {
                             let mut t = TABLE[idx].lock().await;
-                            for bmp_tx in t.bmp_event_tx.values() {
+                            let bmp_event_tx = GLOBAL_BMP_EVENT_TX.load();
+                            for bmp_tx in bmp_event_tx.values() {
                                 let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
                                     e.contains(&family)
                                 } else {
@@ -3543,7 +3554,8 @@ impl Handler {
                         self.table_tx.push(tx);
 
                         if i == 0 {
-                            for bmp_tx in t.bmp_event_tx.values() {
+                            let bmp_event_tx = GLOBAL_BMP_EVENT_TX.load();
+                            for bmp_tx in bmp_event_tx.values() {
                                 let bmp_msg = bmp::Message::PeerUp {
                                     header: bmp::PerPeerHeader::new(
                                         remote_asn,
@@ -3873,7 +3885,8 @@ impl Handler {
                     .take()
                     .unwrap_or(bmp::PeerDownReason::RemoteUnexpected);
                 if i == 0 {
-                    for bmp_tx in t.bmp_event_tx.values() {
+                    let bmp_event_tx = GLOBAL_BMP_EVENT_TX.load();
+                    for bmp_tx in bmp_event_tx.values() {
                         let m = bmp::Message::PeerDown {
                             header: bmp::PerPeerHeader::new(
                                 source.remote_asn,
