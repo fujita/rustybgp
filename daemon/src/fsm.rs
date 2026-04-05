@@ -22,6 +22,9 @@
 use fnv::FnvHashMap;
 use rustybgp_packet::bgp::{self, Capability, Family, HoldTime};
 
+/// Initial hold timer value for OpenSent (RFC 4271 §8.2.2 suggests 4 minutes).
+const INITIAL_HOLD_SECS: u64 = 240;
+
 /// BGP session states (RFC 4271 §8.2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -69,25 +72,26 @@ pub(crate) enum Input {
     Connected,
     /// A complete BGP message was received from the peer.
     MessageReceived(bgp::Message),
-    /// The keepalive timer fired.
-    KeepaliveTick,
-    /// The hold timer check: driver supplies elapsed seconds since last
-    /// keepalive/update was received.
-    HoldTimerCheck { elapsed_secs: u64 },
+    /// The keepalive timer fired (send direction: we may need to send KEEPALIVE).
+    KeepaliveTimerExpired,
+    /// The hold timer fired (receive direction: remote has been silent too long).
+    HoldTimerExpired,
+    /// TCP stream closed or I/O error detected by the driver.
+    Disconnected,
     /// Administrative shutdown (e.g., peer deconfigured).
     AdminShutdown,
+    /// An UPDATE message was sent to the peer; reset the keepalive timer.
+    UpdateSent,
 }
 
 /// Actions the I/O driver should perform.
 pub(crate) enum Output {
     /// Send a BGP message on the wire.
     SendMessage(bgp::Message),
-    /// Configure the keepalive timer interval (seconds; 0 = disable).
-    SetKeepaliveInterval(u64),
-    /// Configure the hold timer (seconds; 0 = disable).
+    /// Arm or re-arm the keepalive timer (send direction, seconds).
+    SetKeepaliveTimer(u64),
+    /// Arm or re-arm the hold timer (receive direction, seconds).
     SetHoldTimer(u64),
-    /// Renew the hold timer (peer sent keepalive or update).
-    RenewHoldTimer,
     /// Negotiated address-family channels. The driver should configure its
     /// PeerCodec with these.
     ChannelsNegotiated(FnvHashMap<Family, bgp::Channel>),
@@ -104,6 +108,9 @@ pub(crate) enum Output {
     /// The FSM state changed. The driver should update any shared state
     /// (e.g., `Arc<PeerState>`).
     StateChanged(State),
+    /// Peer requested route refresh for the given family (RFC 2918).
+    /// The driver should re-advertise its full RIB-Out for that family.
+    RouteRefresh(Family),
 }
 
 /// Reason the session is going down.
@@ -114,6 +121,7 @@ pub(crate) enum SessionDownReason {
     RemoteNotification(bgp::Message),
     FsmError(State),
     AdminShutdown,
+    IoError,
 }
 
 /// Pure BGP session state machine.
@@ -127,8 +135,6 @@ pub(crate) struct Session {
     local_holdtime: u64,
     local_cap: Vec<Capability>,
     expected_remote_asn: u32,
-    #[allow(dead_code)] // Used in collision detection (future PR)
-    is_active: bool,
 
     // Populated after OPEN received
     remote_asn: u32,
@@ -136,6 +142,7 @@ pub(crate) struct Session {
     remote_holdtime: u16,
     remote_cap: Vec<Capability>,
     negotiated_holdtime: u64,
+    keepalive_interval: u64,
 
     // send_max retained after capability negotiation
     send_max: FnvHashMap<Family, usize>,
@@ -148,7 +155,6 @@ impl Session {
         local_cap: Vec<Capability>,
         local_holdtime: u64,
         expected_remote_asn: u32,
-        is_active: bool,
         send_max: FnvHashMap<Family, usize>,
     ) -> Self {
         Session {
@@ -158,12 +164,12 @@ impl Session {
             local_holdtime,
             local_cap,
             expected_remote_asn,
-            is_active,
             remote_asn: 0,
             remote_id: 0,
             remote_holdtime: 0,
             remote_cap: Vec::new(),
             negotiated_holdtime: 0,
+            keepalive_interval: 0,
             send_max,
         }
     }
@@ -172,6 +178,7 @@ impl Session {
         self.state
     }
 
+    #[cfg(test)]
     pub(crate) fn negotiated_holdtime(&self) -> u64 {
         self.negotiated_holdtime
     }
@@ -180,15 +187,8 @@ impl Session {
         &self.send_max
     }
 
-    /// RFC 4271 §6.8: returns true if THIS connection should be kept
-    /// when a collision is detected with the other connection.
-    #[allow(dead_code)] // Used in collision detection (future PR)
-    pub(crate) fn wins_collision(&self) -> bool {
-        if self.local_router_id > self.remote_id {
-            self.is_active
-        } else {
-            !self.is_active
-        }
+    pub(crate) fn remote_id(&self) -> u32 {
+        self.remote_id
     }
 
     /// Process an input event and return actions for the I/O driver.
@@ -196,9 +196,11 @@ impl Session {
         match input {
             Input::Connected => self.on_connected(),
             Input::MessageReceived(msg) => self.on_message(msg),
-            Input::KeepaliveTick => self.on_keepalive_tick(),
-            Input::HoldTimerCheck { elapsed_secs } => self.on_hold_timer_check(elapsed_secs),
+            Input::KeepaliveTimerExpired => self.on_keepalive_timer_expired(),
+            Input::HoldTimerExpired => self.on_hold_timer_expired(),
+            Input::Disconnected => self.on_disconnected(),
             Input::AdminShutdown => self.on_admin_shutdown(),
+            Input::UpdateSent => self.on_update_sent(),
         }
     }
 
@@ -210,10 +212,15 @@ impl Session {
             capability: self.local_cap.clone(),
         });
         self.state = State::OpenSent;
-        vec![
+        let mut out = vec![
             Output::SendMessage(open),
             Output::StateChanged(State::OpenSent),
-        ]
+        ];
+        // RFC 4271 §8.2.2: start hold timer with a large value in OpenSent.
+        if self.local_holdtime != 0 {
+            out.push(Output::SetHoldTimer(INITIAL_HOLD_SECS));
+        }
+        out
     }
 
     fn on_message(&mut self, msg: bgp::Message) -> Vec<Output> {
@@ -222,11 +229,22 @@ impl Session {
             bgp::Message::Keepalive => self.on_keepalive(),
             bgp::Message::Update(_) => self.on_update(),
             bgp::Message::Notification(err) => self.on_notification(err),
-            bgp::Message::RouteRefresh { .. } => Vec::new(),
+            bgp::Message::RouteRefresh { family } => self.on_route_refresh(family),
         }
     }
 
     fn on_open(&mut self, open: bgp::Open) -> Vec<Output> {
+        if self.state != State::OpenSent {
+            return vec![
+                Output::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                        state: u8::from(self.state),
+                    },
+                )),
+                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+            ];
+        }
+
         let mut out = Vec::new();
 
         // Validate ASN if pre-configured
@@ -264,8 +282,8 @@ impl Session {
         // Negotiate holdtime
         self.negotiated_holdtime = std::cmp::min(self.local_holdtime, self.remote_holdtime as u64);
         if self.negotiated_holdtime != 0 {
-            let keepalive_interval = self.negotiated_holdtime / 3;
-            out.push(Output::SetKeepaliveInterval(keepalive_interval));
+            self.keepalive_interval = self.negotiated_holdtime / 3;
+            out.push(Output::SetKeepaliveTimer(self.keepalive_interval));
             out.push(Output::SetHoldTimer(self.negotiated_holdtime));
         }
 
@@ -277,18 +295,32 @@ impl Session {
     }
 
     fn on_keepalive(&mut self) -> Vec<Output> {
-        let mut out = vec![Output::RenewHoldTimer];
-        if self.state == State::OpenConfirm {
-            self.state = State::Established;
-            out.push(Output::StateChanged(State::Established));
-            out.push(Output::SessionEstablished {
-                remote_asn: self.remote_asn,
-                remote_id: self.remote_id,
-                remote_holdtime: self.remote_holdtime,
-                remote_capabilities: std::mem::take(&mut self.remote_cap),
-            });
+        match self.state {
+            State::OpenConfirm => {
+                self.state = State::Established;
+                vec![
+                    Output::SetHoldTimer(self.negotiated_holdtime),
+                    Output::StateChanged(State::Established),
+                    Output::SessionEstablished {
+                        remote_asn: self.remote_asn,
+                        remote_id: self.remote_id,
+                        remote_holdtime: self.remote_holdtime,
+                        remote_capabilities: std::mem::take(&mut self.remote_cap),
+                    },
+                ]
+            }
+            State::Established => {
+                vec![Output::SetHoldTimer(self.negotiated_holdtime)]
+            }
+            _ => vec![
+                Output::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                        state: u8::from(self.state),
+                    },
+                )),
+                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+            ],
         }
-        out
     }
 
     fn on_update(&mut self) -> Vec<Output> {
@@ -302,7 +334,7 @@ impl Session {
                 Output::SessionDown(SessionDownReason::FsmError(self.state)),
             ];
         }
-        vec![Output::RenewHoldTimer]
+        vec![Output::SetHoldTimer(self.negotiated_holdtime)]
     }
 
     fn on_notification(&mut self, err: rustybgp_packet::BgpError) -> Vec<Output> {
@@ -311,20 +343,49 @@ impl Session {
         ))]
     }
 
-    fn on_keepalive_tick(&mut self) -> Vec<Output> {
-        if self.state == State::Established {
-            vec![Output::SendMessage(bgp::Message::Keepalive)]
+    fn on_route_refresh(&mut self, family: Family) -> Vec<Output> {
+        if self.state != State::Established {
+            return vec![
+                Output::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                        state: u8::from(self.state),
+                    },
+                )),
+                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+            ];
+        }
+        vec![Output::RouteRefresh(family)]
+    }
+
+    fn on_keepalive_timer_expired(&mut self) -> Vec<Output> {
+        match self.state {
+            State::OpenConfirm | State::Established => vec![
+                Output::SendMessage(bgp::Message::Keepalive),
+                Output::SetKeepaliveTimer(self.keepalive_interval),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn on_hold_timer_expired(&mut self) -> Vec<Output> {
+        match self.state {
+            State::OpenSent | State::OpenConfirm | State::Established => {
+                vec![Output::SessionDown(SessionDownReason::HoldTimerExpired)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn on_update_sent(&mut self) -> Vec<Output> {
+        if self.state == State::Established && self.keepalive_interval > 0 {
+            vec![Output::SetKeepaliveTimer(self.keepalive_interval)]
         } else {
             Vec::new()
         }
     }
 
-    fn on_hold_timer_check(&mut self, elapsed_secs: u64) -> Vec<Output> {
-        if self.negotiated_holdtime != 0 && elapsed_secs > self.negotiated_holdtime + 20 {
-            vec![Output::SessionDown(SessionDownReason::HoldTimerExpired)]
-        } else {
-            Vec::new()
-        }
+    fn on_disconnected(&mut self) -> Vec<Output> {
+        vec![Output::SessionDown(SessionDownReason::IoError)]
     }
 
     fn on_admin_shutdown(&mut self) -> Vec<Output> {
@@ -338,6 +399,212 @@ impl Session {
             )),
             Output::SessionDown(SessionDownReason::AdminShutdown),
         ]
+    }
+}
+
+/// Connection role for collision detection (RFC 4271 §6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Active,
+    Passive,
+}
+
+impl Role {
+    fn other(self) -> Self {
+        match self {
+            Role::Active => Role::Passive,
+            Role::Passive => Role::Active,
+        }
+    }
+}
+
+/// Output from PeerFsm, wrapping Session outputs with role information
+/// and collision detection results.
+#[allow(dead_code)]
+pub(crate) enum PeerFsmOutput {
+    /// An output from the Session for the given role.
+    Session(Role, Output),
+    /// Collision detected: close the connection for this role.
+    CloseConnection(Role),
+    /// Passive connection reached OpenConfirm; Driver should stop active
+    /// connection attempts (no new TCP connect while passive is progressing).
+    StopActiveConnect,
+}
+
+/// Manages up to two concurrent Sessions (active + passive) for a single
+/// BGP peer. Handles collision detection per RFC 4271 §6.8.
+///
+/// Pure logic — no async, no I/O.
+#[allow(dead_code)]
+pub(crate) struct PeerFsm {
+    active: Option<Session>,
+    passive: Option<Session>,
+    pub(crate) local_router_id: u32,
+    local_asn: u32,
+    local_cap: Vec<Capability>,
+    local_holdtime: u64,
+    expected_remote_asn: u32,
+    send_max: FnvHashMap<Family, usize>,
+}
+
+#[allow(dead_code)]
+impl PeerFsm {
+    pub(crate) fn new(
+        local_router_id: u32,
+        local_asn: u32,
+        local_cap: Vec<Capability>,
+        local_holdtime: u64,
+        expected_remote_asn: u32,
+        send_max: FnvHashMap<Family, usize>,
+    ) -> Self {
+        PeerFsm {
+            active: None,
+            passive: None,
+            local_router_id,
+            local_asn,
+            local_cap,
+            local_holdtime,
+            expected_remote_asn,
+            send_max,
+        }
+    }
+
+    /// Close a connection, removing its Session.
+    pub(crate) fn close_connection(&mut self, role: Role) {
+        match role {
+            Role::Active => self.active = None,
+            Role::Passive => self.passive = None,
+        }
+    }
+
+    /// Reference to the Session for the given role.
+    pub(crate) fn session(&self, role: Role) -> Option<&Session> {
+        match role {
+            Role::Active => self.active.as_ref(),
+            Role::Passive => self.passive.as_ref(),
+        }
+    }
+
+    /// Mutable reference to the Session for the given role.
+    pub(crate) fn session_mut(&mut self, role: Role) -> Option<&mut Session> {
+        match role {
+            Role::Active => self.active.as_mut(),
+            Role::Passive => self.passive.as_mut(),
+        }
+    }
+
+    /// Process an input for the given role's Session.
+    /// For Input::Connected, creates the Session if the slot is free or returns
+    /// CloseConnection if a Session for this role already exists.
+    /// Includes collision detection: if both Sessions reach OpenConfirm,
+    /// the loser is sent a CEASE notification and closed.
+    pub(crate) fn process(&mut self, role: Role, input: Input) -> Vec<PeerFsmOutput> {
+        if matches!(input, Input::Connected) {
+            return self.on_connected(role);
+        }
+        let Some(session) = self.session_mut(role) else {
+            return Vec::new();
+        };
+        let outputs = session.process(input);
+
+        let entered_open_confirm = outputs
+            .iter()
+            .any(|o| matches!(o, Output::StateChanged(State::OpenConfirm)));
+        let session_down = outputs.iter().any(|o| matches!(o, Output::SessionDown(_)));
+
+        let mut result: Vec<PeerFsmOutput> = outputs
+            .into_iter()
+            .map(|o| PeerFsmOutput::Session(role, o))
+            .collect();
+
+        if entered_open_confirm {
+            if role == Role::Passive {
+                result.push(PeerFsmOutput::StopActiveConnect);
+            }
+            if let Some(collision_outputs) = self.check_collision(role) {
+                result.extend(collision_outputs);
+            }
+        }
+
+        // Auto-clear the session slot when the session goes down.
+        if session_down {
+            self.close_connection(role);
+        }
+
+        result
+    }
+
+    /// Handle a new TCP connection for the given role.
+    /// Creates a Session and starts the OPEN exchange, or returns CloseConnection
+    /// if a Session for this role already exists.
+    fn on_connected(&mut self, role: Role) -> Vec<PeerFsmOutput> {
+        let slot = match role {
+            Role::Active => &mut self.active,
+            Role::Passive => &mut self.passive,
+        };
+        if slot.is_some() {
+            return vec![PeerFsmOutput::CloseConnection(role)];
+        }
+        *slot = Some(Session::new(
+            self.local_asn,
+            self.local_router_id,
+            self.local_cap.clone(),
+            self.local_holdtime,
+            self.expected_remote_asn,
+            self.send_max.clone(),
+        ));
+        let outputs = slot.as_mut().unwrap().process(Input::Connected);
+        outputs
+            .into_iter()
+            .map(|o| PeerFsmOutput::Session(role, o))
+            .collect()
+    }
+
+    /// RFC 4271 §6.8: determine which role wins a connection collision.
+    /// The Active connection wins when local Router ID > remote Router ID,
+    /// the Passive connection wins otherwise.
+    fn collision_winner(&self, role: Role) -> Role {
+        let remote_id = self.session(role).map(|s| s.remote_id()).unwrap_or(0);
+        if self.local_router_id > remote_id {
+            Role::Active
+        } else {
+            Role::Passive
+        }
+    }
+
+    /// Check for collision when a Session enters OpenConfirm.
+    /// Returns outputs to close the losing connection, or None if no collision.
+    fn check_collision(&mut self, role: Role) -> Option<Vec<PeerFsmOutput>> {
+        let other_role = role.other();
+        let other_state = self.session(other_role)?.state();
+
+        // Collision only if the other connection is also in OpenConfirm or Established
+        if other_state != State::OpenConfirm && other_state != State::Established {
+            return None;
+        }
+
+        let winner = self.collision_winner(role);
+        let loser = winner.other();
+
+        // Send CEASE to the loser
+        let outputs = vec![
+            PeerFsmOutput::Session(
+                loser,
+                Output::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::Other {
+                        code: 6,    // Cease
+                        subcode: 7, // Connection Collision Resolution
+                        data: vec![],
+                    },
+                )),
+            ),
+            PeerFsmOutput::CloseConnection(loser),
+        ];
+
+        // Remove the loser's Session
+        self.close_connection(loser);
+
+        Some(outputs)
     }
 }
 
@@ -361,7 +628,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             90,
             65002,
-            false,
             FnvHashMap::default(),
         )
     }
@@ -419,7 +685,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SetKeepaliveInterval(20)
+            Output::SetKeepaliveTimer(20)
         ))); // min(90,60)/3
         assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60)))); // min(90,60)
         assert!(has_output(&out, |o| matches!(
@@ -438,7 +704,6 @@ mod tests {
             o,
             Output::SessionEstablished { .. }
         )));
-        assert!(has_output(&out, |o| matches!(o, Output::RenewHoldTimer)));
     }
 
     #[test]
@@ -459,6 +724,34 @@ mod tests {
     }
 
     #[test]
+    fn open_in_unexpected_state_sends_fsm_error() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        // OPEN received in Established → FSM error
+        let out = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SendMessage(bgp::Message::Notification(_))
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::FsmError(_))
+        )));
+    }
+
+    #[test]
     fn dynamic_peer_accepts_any_asn() {
         let mut s = Session::new(
             65001,
@@ -466,7 +759,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             90,
             0, // accept any
-            false,
             FnvHashMap::default(),
         );
         let _ = s.process(Input::Connected);
@@ -505,12 +797,7 @@ mod tests {
         let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert_eq!(s.state(), State::Established);
 
-        // Within tolerance
-        let out = s.process(Input::HoldTimerCheck { elapsed_secs: 70 });
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
-
-        // Expired (> negotiated + 20)
-        let out = s.process(Input::HoldTimerCheck { elapsed_secs: 81 });
+        let out = s.process(Input::HoldTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
             Output::SessionDown(SessionDownReason::HoldTimerExpired)
@@ -518,17 +805,53 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_tick_only_in_established() {
+    fn connected_starts_initial_hold_timer() {
+        let mut s = basic_session();
+        let out = s.process(Input::Connected);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetHoldTimer(INITIAL_HOLD_SECS)
+        )));
+    }
+
+    #[test]
+    fn hold_timer_expired_in_open_sent_shuts_down() {
         let mut s = basic_session();
         let _ = s.process(Input::Connected);
+        let out = s.process(Input::HoldTimerExpired);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::HoldTimerExpired)
+        )));
+    }
 
-        // OpenSent: no keepalive
-        let out = s.process(Input::KeepaliveTick);
-        assert!(!has_output(&out, |o| matches!(
+    #[test]
+    fn keepalive_timer_expired_sends_keepalive_and_rearms() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        assert_eq!(s.state(), State::OpenConfirm);
+
+        // RFC 4271 §8.2.2: keepalive timer fires in OpenConfirm → send KEEPALIVE + re-arm
+        let out = s.process(Input::KeepaliveTimerExpired);
+        assert!(has_output(&out, |o| matches!(
             o,
             Output::SendMessage(bgp::Message::Keepalive)
         )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetKeepaliveTimer(20)
+        )));
+    }
 
+    #[test]
+    fn keepalive_timer_expired_in_established_sends_keepalive_and_rearms() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -537,11 +860,136 @@ mod tests {
         let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert_eq!(s.state(), State::Established);
 
-        // Established: send keepalive
-        let out = s.process(Input::KeepaliveTick);
+        // RFC 4271 §8.2.2: keepalive timer fires in Established → send KEEPALIVE + re-arm
+        let out = s.process(Input::KeepaliveTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
             Output::SendMessage(bgp::Message::Keepalive)
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetKeepaliveTimer(20)
+        )));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+    }
+
+    #[test]
+    fn keepalive_timer_expired_in_idle_is_noop() {
+        let mut s = basic_session();
+        assert_eq!(s.state(), State::Idle);
+
+        // Timer fires before session is active → silently ignored
+        let out = s.process(Input::KeepaliveTimerExpired);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn keepalive_in_established_resets_hold_timer() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        // KEEPALIVE received → reset hold timer to full negotiated_holdtime
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+    }
+
+    #[test]
+    fn update_in_established_resets_hold_timer() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        // UPDATE received → reset hold timer to full negotiated_holdtime
+        let update = bgp::Message::Update(bgp::Update {
+            reach: None,
+            mp_reach: None,
+            unreach: None,
+            mp_unreach: None,
+            attr: std::sync::Arc::new(Vec::new()),
+            nexthop: None,
+        });
+        let out = s.process(Input::MessageReceived(update));
+        assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+    }
+
+    #[test]
+    fn hold_timer_expired_in_idle_is_noop() {
+        let mut s = basic_session();
+        assert_eq!(s.state(), State::Idle);
+
+        // Timer fires before session is active → silently ignored
+        let out = s.process(Input::HoldTimerExpired);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn keepalive_in_unexpected_state_sends_fsm_error() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        // State is now OpenSent — KEEPALIVE before OPEN is an FSM error
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SendMessage(bgp::Message::Notification(_))
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::FsmError(_))
+        )));
+    }
+
+    #[test]
+    fn route_refresh_in_established_triggers_readvertise() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        let out = s.process(Input::MessageReceived(bgp::Message::RouteRefresh {
+            family: Family::IPV4,
+        }));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::RouteRefresh(Family::IPV4)
+        )));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+    }
+
+    #[test]
+    fn route_refresh_in_non_established_sends_fsm_error() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        // State is OpenSent
+        let out = s.process(Input::MessageReceived(bgp::Message::RouteRefresh {
+            family: Family::IPV4,
+        }));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SendMessage(bgp::Message::Notification(_))
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::FsmError(_))
         )));
     }
 
@@ -581,87 +1029,32 @@ mod tests {
     }
 
     #[test]
-    fn collision_active_wins_when_local_id_higher() {
-        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
-        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+    fn update_sent_in_established_resets_keepalive_timer() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
 
-        let mut active = Session::new(
-            65001,
-            high_id,
-            vec![],
-            90,
-            65001,
-            true,
-            FnvHashMap::default(),
-        );
-        let _ = active.process(Input::Connected);
-        let _ = active.process(Input::MessageReceived(bgp::Message::Open(bgp::Open {
-            as_number: 65001,
-            holdtime: HoldTime::new(60).unwrap(),
-            router_id: low_id,
-            capability: vec![],
-        })));
-        assert!(active.wins_collision());
-
-        let mut passive = Session::new(
-            65001,
-            high_id,
-            vec![],
-            90,
-            65001,
-            false,
-            FnvHashMap::default(),
-        );
-        let _ = passive.process(Input::Connected);
-        let _ = passive.process(Input::MessageReceived(bgp::Message::Open(bgp::Open {
-            as_number: 65001,
-            holdtime: HoldTime::new(60).unwrap(),
-            router_id: low_id,
-            capability: vec![],
-        })));
-        assert!(!passive.wins_collision());
+        let out = s.process(Input::UpdateSent);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetKeepaliveTimer(20)
+        )));
     }
 
     #[test]
-    fn collision_passive_wins_when_local_id_lower() {
-        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
-        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+    fn update_sent_in_non_established_is_noop() {
+        let mut s = basic_session();
+        let _ = s.process(Input::Connected);
+        assert_eq!(s.state(), State::OpenSent);
 
-        let mut passive = Session::new(
-            65001,
-            low_id,
-            vec![],
-            90,
-            65001,
-            false,
-            FnvHashMap::default(),
-        );
-        let _ = passive.process(Input::Connected);
-        let _ = passive.process(Input::MessageReceived(bgp::Message::Open(bgp::Open {
-            as_number: 65001,
-            holdtime: HoldTime::new(60).unwrap(),
-            router_id: high_id,
-            capability: vec![],
-        })));
-        assert!(passive.wins_collision());
-
-        let mut active = Session::new(
-            65001,
-            low_id,
-            vec![],
-            90,
-            65001,
-            true,
-            FnvHashMap::default(),
-        );
-        let _ = active.process(Input::Connected);
-        let _ = active.process(Input::MessageReceived(bgp::Message::Open(bgp::Open {
-            as_number: 65001,
-            holdtime: HoldTime::new(60).unwrap(),
-            router_id: high_id,
-            capability: vec![],
-        })));
-        assert!(!active.wins_collision());
+        let out = s.process(Input::UpdateSent);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -688,7 +1081,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             0, // disabled holdtime
             65002,
-            false,
             FnvHashMap::default(),
         );
         let _ = s.process(Input::Connected);
@@ -701,8 +1093,366 @@ mod tests {
         assert_eq!(s.negotiated_holdtime(), 0);
         assert!(!has_output(&out, |o| matches!(
             o,
-            Output::SetKeepaliveInterval(_)
+            Output::SetKeepaliveTimer(_)
         )));
         assert!(!has_output(&out, |o| matches!(o, Output::SetHoldTimer(_))));
+    }
+
+    // --- PeerFsm tests ---
+
+    fn make_peer_fsm(local_id: u32, expected_asn: u32) -> PeerFsm {
+        PeerFsm::new(
+            local_id,
+            65001,
+            vec![Capability::MultiProtocol(Family::IPV4)],
+            90,
+            expected_asn,
+            FnvHashMap::default(),
+        )
+    }
+
+    fn connect(peer: &mut PeerFsm, role: Role) -> Vec<PeerFsmOutput> {
+        peer.process(role, Input::Connected)
+    }
+
+    fn remote_open_msg(asn: u32, router_id: u32) -> bgp::Message {
+        bgp::Message::Open(bgp::Open {
+            as_number: asn,
+            holdtime: HoldTime::new(60).unwrap(),
+            router_id,
+            capability: vec![Capability::MultiProtocol(Family::IPV4)],
+        })
+    }
+
+    fn has_peer_output<F: Fn(&PeerFsmOutput) -> bool>(outputs: &[PeerFsmOutput], pred: F) -> bool {
+        outputs.iter().any(pred)
+    }
+
+    #[test]
+    fn peer_fsm_single_active_reaches_established() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        connect(&mut peer, Role::Active);
+
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        assert_eq!(
+            peer.session(Role::Active).unwrap().state(),
+            State::OpenConfirm
+        );
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(bgp::Message::Keepalive),
+        );
+        assert_eq!(
+            peer.session(Role::Active).unwrap().state(),
+            State::Established
+        );
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+    }
+
+    #[test]
+    fn peer_fsm_single_passive_reaches_established() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        connect(&mut peer, Role::Passive);
+
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(bgp::Message::Keepalive),
+        );
+        assert_eq!(
+            peer.session(Role::Passive).unwrap().state(),
+            State::Established
+        );
+    }
+
+    #[test]
+    fn peer_fsm_passive_open_confirm_emits_stop_active_connect() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        connect(&mut peer, Role::Passive);
+
+        // Passive receives OPEN → enters OpenConfirm → StopActiveConnect emitted
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        assert_eq!(
+            peer.session(Role::Passive).unwrap().state(),
+            State::OpenConfirm
+        );
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::StopActiveConnect
+        )));
+    }
+
+    #[test]
+    fn peer_fsm_active_open_confirm_does_not_emit_stop_active_connect() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        connect(&mut peer, Role::Active);
+
+        // Active receives OPEN → enters OpenConfirm → StopActiveConnect NOT emitted
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        assert_eq!(
+            peer.session(Role::Active).unwrap().state(),
+            State::OpenConfirm
+        );
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::StopActiveConnect
+        )));
+    }
+
+    #[test]
+    fn peer_fsm_no_collision_when_only_one_in_open_confirm() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Active receives OPEN → OpenConfirm, passive still in OpenSent → no collision
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+        assert!(peer.session(Role::Active).is_some());
+        assert!(peer.session(Role::Passive).is_some());
+    }
+
+    #[test]
+    fn peer_fsm_collision_active_wins_when_local_id_higher() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Active → OpenConfirm
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+
+        // Passive → OpenConfirm → collision detected
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+
+        // local_id > remote_id → active wins → passive closed
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(Role::Passive)
+        )));
+        assert!(peer.session(Role::Active).is_some());
+        assert!(peer.session(Role::Passive).is_none());
+    }
+
+    #[test]
+    fn peer_fsm_collision_passive_wins_when_local_id_lower() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(low_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Active → OpenConfirm
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, high_id)),
+        );
+
+        // Passive → OpenConfirm → collision detected
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, high_id)),
+        );
+
+        // local_id < remote_id → passive wins → active closed
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(Role::Active)
+        )));
+        assert!(peer.session(Role::Active).is_none());
+        assert!(peer.session(Role::Passive).is_some());
+    }
+
+    #[test]
+    fn peer_fsm_collision_when_one_already_established() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+
+        // Active reaches Established
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(bgp::Message::Keepalive),
+        );
+        assert_eq!(
+            peer.session(Role::Active).unwrap().state(),
+            State::Established
+        );
+
+        // Passive connects and receives OPEN → OpenConfirm → collision with Established
+        connect(&mut peer, Role::Passive);
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+
+        // local_id > remote_id, active wins → passive closed
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(Role::Passive)
+        )));
+        assert!(peer.session(Role::Active).is_some());
+        assert!(peer.session(Role::Passive).is_none());
+    }
+
+    #[test]
+    fn peer_fsm_winner_continues_after_collision() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Both reach OpenConfirm → passive closed
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        assert!(peer.session(Role::Passive).is_none());
+
+        // Active continues to Established
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(bgp::Message::Keepalive),
+        );
+        assert_eq!(
+            peer.session(Role::Active).unwrap().state(),
+            State::Established
+        );
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Session(Role::Active, Output::SessionEstablished { .. })
+        )));
+    }
+
+    #[test]
+    fn peer_fsm_collision_triggered_when_active_enters_open_confirm_second() {
+        // Passive reaches OpenConfirm first; collision is triggered when Active
+        // subsequently enters OpenConfirm (the reverse order from the other tests).
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Passive → OpenConfirm first; Active still in OpenSent → no collision yet
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+        assert_eq!(
+            peer.session(Role::Passive).unwrap().state(),
+            State::OpenConfirm
+        );
+
+        // Active → OpenConfirm second → collision detected, local_id > remote_id → active wins
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(Role::Passive)
+        )));
+        assert!(peer.session(Role::Active).is_some());
+        assert!(peer.session(Role::Passive).is_none());
+    }
+
+    #[test]
+    fn peer_fsm_duplicate_role_rejected() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        let out = connect(&mut peer, Role::Active);
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+        // Second Connected on same role → CloseConnection returned
+        let out = connect(&mut peer, Role::Active);
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(Role::Active)
+        )));
+    }
+
+    #[test]
+    fn peer_fsm_cease_notification_sent_to_loser() {
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+
+        // CEASE notification (code 6, subcode 7) sent to the loser (passive)
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Session(
+                Role::Passive,
+                Output::SendMessage(bgp::Message::Notification(_))
+            )
+        )));
     }
 }

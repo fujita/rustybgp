@@ -3466,10 +3466,8 @@ struct Handler {
     session: crate::fsm::Session,
 
     stream: Option<TcpStream>,
-    keepalive_timer: tokio::time::Interval,
     source: Option<Arc<table::Source>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
-    holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
@@ -3500,7 +3498,6 @@ impl Handler {
             local_cap.clone(),
             local_holdtime,
             expected_remote_asn,
-            false, // TODO: set based on active/passive in collision detection PR
             send_max,
         );
         Some(Handler {
@@ -3514,14 +3511,9 @@ impl Handler {
             local_cap,
             rs_client,
             session,
-            keepalive_timer: tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::new(u32::MAX.into(), 0),
-                Duration::from_secs(3600),
-            ),
             stream: Some(stream),
             source: None,
             peer_event_tx: Vec::new(),
-            holdtimer_renewed: Instant::now(),
             shutdown: None,
             prefix_limits,
         })
@@ -3651,6 +3643,7 @@ impl Handler {
         outputs: Vec<crate::fsm::Output>,
         urgent: &mut Vec<bgp::Message>,
         framer: &mut BgpFramer,
+        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         local_sockaddr: SocketAddr,
@@ -3661,16 +3654,15 @@ impl Handler {
                 crate::fsm::Output::SendMessage(m) => {
                     urgent.push(m);
                 }
-                crate::fsm::Output::SetKeepaliveInterval(secs) => {
-                    self.keepalive_timer = tokio::time::interval(Duration::from_secs(secs));
+                crate::fsm::Output::SetKeepaliveTimer(secs) => {
+                    *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                        .into_iter()
+                        .collect();
                 }
                 crate::fsm::Output::SetHoldTimer(secs) => {
                     *holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
-                }
-                crate::fsm::Output::RenewHoldTimer => {
-                    self.holdtimer_renewed = Instant::now();
                 }
                 crate::fsm::Output::ChannelsNegotiated(channels) => {
                     // Log Add-Path warnings for locally configured but not negotiated families
@@ -3743,10 +3735,17 @@ impl Handler {
                         crate::fsm::SessionDownReason::AdminShutdown => {
                             bmp::PeerDownReason::LocalFsm(0)
                         }
+                        crate::fsm::SessionDownReason::IoError => {
+                            bmp::PeerDownReason::RemoteUnexpected
+                        }
                     });
                 }
                 crate::fsm::Output::StateChanged(s) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
+                }
+                crate::fsm::Output::RouteRefresh(family) => {
+                    // TODO: re-advertise full RIB-Out for `family` to this peer.
+                    let _ = family;
                 }
             }
         }
@@ -3758,6 +3757,7 @@ impl Handler {
         framer: &mut BgpFramer,
         txbuf_size: usize,
         urgent: &mut Vec<bgp::Message>,
+        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) {
         // 1. Flush urgent (open, keepalive, notification) messages.
@@ -3783,6 +3783,7 @@ impl Handler {
 
         // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+        let any_update_pending = pending.values().any(|p| !p.is_empty());
         for (family, p) in pending.iter_mut() {
             // IPv4-unicast can carry reachability either in the UPDATE's
             // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
@@ -3810,6 +3811,16 @@ impl Handler {
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+        }
+        if any_update_pending {
+            let outputs = self.session.process(crate::fsm::Input::UpdateSent);
+            for output in outputs {
+                if let crate::fsm::Output::SetKeepaliveTimer(secs) = output {
+                    *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                        .into_iter()
+                        .collect();
+                }
+            }
         }
     }
 
@@ -3857,6 +3868,7 @@ impl Handler {
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
         urgent: &mut Vec<bgp::Message>,
+        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) -> std::result::Result<(), Error> {
@@ -3884,6 +3896,7 @@ impl Handler {
             outputs,
             urgent,
             framer,
+            keepalive_futures,
             holdtime_futures,
             pending,
             local_sockaddr,
@@ -3948,6 +3961,10 @@ impl Handler {
             vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
                 .collect();
+        let mut keepalive_futures: FuturesUnordered<_> =
+            vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .into_iter()
+                .collect();
 
         // Kick off the OPEN exchange via the FSM.
         let outputs = self.session.process(crate::fsm::Input::Connected);
@@ -3955,6 +3972,7 @@ impl Handler {
             outputs,
             &mut urgent,
             &mut framer,
+            &mut keepalive_futures,
             &mut holdtime_futures,
             &mut pending_update,
             local_sockaddr,
@@ -3981,25 +3999,19 @@ impl Handler {
             };
 
             futures::select_biased! {
-                _ = self.keepalive_timer.tick().fuse() => {
-                    let outputs = self.session.process(crate::fsm::Input::KeepaliveTick);
-                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
-                }
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
                         urgent.insert(0, msg);
                     }
                 }
                 _ = holdtime_futures.next() => {
-                    let elapsed = self.holdtimer_renewed.elapsed().as_secs();
-                    let outputs = self.session.process(crate::fsm::Input::HoldTimerCheck { elapsed_secs: elapsed });
-                    if !outputs.is_empty() {
-                        println!("{}: holdtime expired {}", self.remote_addr, elapsed);
-                        self.apply_outputs(outputs, &mut urgent, &mut framer, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
-                    } else {
-                        let negotiated = self.session.negotiated_holdtime();
-                        holdtime_futures.push(tokio::time::sleep(Duration::from_secs(negotiated - elapsed + 10)));
-                    }
+                    println!("{}: holdtime expired", self.remote_addr);
+                    let outputs = self.session.process(crate::fsm::Input::HoldTimerExpired);
+                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                }
+                _ = keepalive_futures.next() => {
+                    let outputs = self.session.process(crate::fsm::Input::KeepaliveTimerExpired);
+                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
@@ -4055,7 +4067,7 @@ impl Handler {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut framer, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut holdtime_futures, &mut pending_update).await;
+                                            let _ = self.rx_msg(&mut framer, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update).await;
                                         }
                                         None => {
                                             // partial read
@@ -4081,7 +4093,7 @@ impl Handler {
                     }
 
                     if ready.is_writable() {
-                        self.flush_tx(&mut stream, &mut framer, txbuf_size, &mut urgent, &mut pending_update).await;
+                        self.flush_tx(&mut stream, &mut framer, txbuf_size, &mut urgent, &mut keepalive_futures, &mut pending_update).await;
                     }
                 }
             }
