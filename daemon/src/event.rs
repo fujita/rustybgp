@@ -148,11 +148,11 @@ struct PeerState {
 /// Wraps a oneshot Sender so that `Peer` can derive `Clone`.
 /// Cloning produces `None` — the clone is for read-only listing, not signalling.
 #[derive(Default)]
-struct CollisionTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
+struct CloseTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
 
-impl Clone for CollisionTx {
+impl Clone for CloseTx {
     fn clone(&self) -> Self {
-        CollisionTx(None)
+        CloseTx(None)
     }
 }
 
@@ -189,7 +189,6 @@ struct Peer {
     multihop_ttl: Option<u8>,
     password: Option<String>,
 
-    mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     /// Per-family send_max for Add-Path TX (RFC 7911).
     send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
@@ -203,8 +202,8 @@ struct Peer {
     peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
     /// One-shot channels used by the collision winner to deliver a CEASE
     /// Notification to the losing Handler. Each is consumed at most once.
-    active_collision_tx: CollisionTx,
-    passive_collision_tx: CollisionTx,
+    active_close_tx: CloseTx,
+    passive_close_tx: CloseTx,
 }
 
 impl Peer {
@@ -232,9 +231,8 @@ impl Peer {
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
-        self.mgmt_tx = None;
-        self.active_collision_tx = CollisionTx::default();
-        self.passive_collision_tx = CollisionTx::default();
+        self.active_close_tx = CloseTx::default();
+        self.passive_close_tx = CloseTx::default();
     }
 }
 
@@ -253,7 +251,6 @@ struct PeerBuilder {
     state: SessionState,
     holdtime: u64,
     connect_retry_time: u64,
-    ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
     password: Option<String>,
     families: FnvHashMap<Family, u8>,
@@ -281,18 +278,12 @@ impl PeerBuilder {
             state: SessionState::Idle,
             holdtime: Self::DEFAULT_HOLD_TIME,
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
-            ctrl_channel: None,
             multihop_ttl: None,
             password: None,
             families: Default::default(),
             send_max: Default::default(),
             prefix_limits: Default::default(),
         }
-    }
-
-    fn ctrl_channel(&mut self, tx: mpsc::UnboundedSender<PeerMgmtMsg>) -> &mut Self {
-        self.ctrl_channel = Some(tx);
-        self
     }
 
     fn families(&mut self, families: Vec<Family>) -> &mut Self {
@@ -454,7 +445,6 @@ impl PeerBuilder {
             route_stats: FnvHashMap::default(),
             local_cap: self.local_cap.split_off(0),
             route_server_client: self.rs_client,
-            mgmt_tx: self.ctrl_channel.take(),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
             multihop_ttl: self.multihop_ttl.take(),
@@ -462,8 +452,8 @@ impl PeerBuilder {
             send_max: std::mem::take(&mut self.send_max),
             prefix_limits: std::mem::take(&mut self.prefix_limits),
             peer_fsm: None,
-            active_collision_tx: CollisionTx::default(),
-            passive_collision_tx: CollisionTx::default(),
+            active_close_tx: CloseTx::default(),
+            passive_close_tx: CloseTx::default(),
         }
     }
 }
@@ -925,15 +915,17 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeletePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             let mut global = GLOBAL.write().await;
-            if let Some(p) = global.peers.remove(&peer_addr) {
-                if let Some(mgmt_tx) = &p.mgmt_tx {
-                    let _ = mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification(
-                        rustybgp_packet::BgpError::Other {
-                            code: 6,
-                            subcode: 3,
-                            data: vec![],
-                        },
-                    )));
+            if let Some(mut p) = global.peers.remove(&peer_addr) {
+                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+                    code: 6,
+                    subcode: 3,
+                    data: vec![],
+                });
+                for tx in [p.active_close_tx.0.take(), p.passive_close_tx.0.take()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = tx.send(cease.clone());
                 }
                 if p.password.is_some() {
                     for fd in &global.listen_sockets {
@@ -1062,15 +1054,16 @@ impl GoBgpService for GrpcService {
                         ));
                     } else {
                         p.admin_down = true;
-                        if let Some(mgmt_tx) = &p.mgmt_tx {
-                            let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                                    code: 6,
-                                    subcode: 2,
-                                    data: vec![],
-                                }),
-                            ));
-                            return Ok(tonic::Response::new(api::DisablePeerResponse {}));
+                        let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+                            code: 6,
+                            subcode: 2,
+                            data: vec![],
+                        });
+                        for tx in [p.active_close_tx.0.take(), p.passive_close_tx.0.take()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let _ = tx.send(cease.clone());
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                     }
@@ -2002,10 +1995,6 @@ enum ToPeerEvent {
     Advertise(table::Change),
 }
 
-enum PeerMgmtMsg {
-    Notification(bgp::Message),
-}
-
 fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     if peer.admin_down || peer.passive || peer.delete_on_disconnected {
         return;
@@ -2038,7 +2027,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             {
                 let server = GLOBAL.write().await;
                 if let Some(peer) = server.peers.get(&peer_addr) {
-                    if peer.configured_time != configured_time || peer.mgmt_tx.is_some() {
+                    if peer.configured_time != configured_time || peer.active_close_tx.0.is_some() {
                         return;
                     }
                 } else {
@@ -2709,15 +2698,12 @@ impl Global {
         Ok(())
     }
 
-    async fn accept_connection(
-        stream: TcpStream,
-        role: crate::fsm::Role,
-    ) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
+    async fn accept_connection(stream: TcpStream, role: crate::fsm::Role) -> Option<Handler> {
         let local_sockaddr = stream.local_addr().ok()?;
         let remote_sockaddr = stream.peer_addr().ok()?;
         let remote_addr = remote_sockaddr.ip();
         let mut global = GLOBAL.write().await;
-        let (peer, mgmt_rx) = match global.peers.get_mut(&remote_addr) {
+        let peer = match global.peers.get_mut(&remote_addr) {
             Some(peer) => {
                 if peer.admin_down {
                     println!(
@@ -2726,8 +2712,12 @@ impl Global {
                     );
                     return None;
                 }
-                if peer.mgmt_tx.is_some() {
-                    println!("already has connection {}", remote_addr);
+                let already_connected = match role {
+                    crate::fsm::Role::Active => peer.active_close_tx.0.is_some(),
+                    crate::fsm::Role::Passive => peer.passive_close_tx.0.is_some(),
+                };
+                if already_connected {
+                    println!("already has {:?} connection {}", role, remote_addr);
                     return None;
                 }
                 peer.remote_sockaddr = remote_sockaddr;
@@ -2735,9 +2725,7 @@ impl Global {
                 peer.state
                     .fsm
                     .store(SessionState::Active as u8, Ordering::Relaxed);
-                let (tx, rx) = mpsc::unbounded_channel();
-                peer.mgmt_tx = Some(tx);
-                (peer, rx)
+                peer
             }
             None => {
                 let mut is_dynamic = false;
@@ -2762,7 +2750,6 @@ impl Global {
                     );
                     return None;
                 }
-                let (tx, rx) = mpsc::unbounded_channel();
                 let mut builder = PeerBuilder::new(remote_addr);
                 builder
                     .state(SessionState::Active)
@@ -2770,14 +2757,12 @@ impl Global {
                     .delete_on_disconnected(true)
                     .rs_client(rs_client)
                     .remote_sockaddr(remote_sockaddr)
-                    .local_sockaddr(local_sockaddr)
-                    .ctrl_channel(tx);
+                    .local_sockaddr(local_sockaddr);
                 if let Some(holdtime) = holdtime {
                     builder.holdtime(holdtime);
                 }
                 let _ = global.add_peer(builder.build(), None);
-                let peer = global.peers.get_mut(&remote_addr).unwrap();
-                (peer, rx)
+                global.peers.get_mut(&remote_addr).unwrap()
             }
         };
         if let Some(ttl) = peer.multihop_ttl {
@@ -2788,12 +2773,10 @@ impl Global {
             let _ = stream.set_ttl(1);
         }
         let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
-        let (collision_tx, collision_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
         match role {
-            crate::fsm::Role::Active => peer.active_collision_tx = CollisionTx(Some(collision_tx)),
-            crate::fsm::Role::Passive => {
-                peer.passive_collision_tx = CollisionTx(Some(collision_tx))
-            }
+            crate::fsm::Role::Active => peer.active_close_tx = CloseTx(Some(close_tx)),
+            crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx(Some(close_tx)),
         }
         Handler::new(
             stream,
@@ -2803,13 +2786,12 @@ impl Global {
             peer.route_server_client,
             role,
             peer_fsm,
-            Some(collision_rx),
+            Some(close_rx),
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
             peer.prefix_limits.clone(),
         )
-        .map(|h| (h, mgmt_rx))
     }
 
     async fn serve(
@@ -3158,14 +3140,14 @@ impl Global {
             futures::select_biased! {
                 stream = bgp_listen_futures.next() => {
                     if let Some(Some(Ok(stream))) = stream
-                        && let Some(r) = Global::accept_connection(stream, crate::fsm::Role::Passive).await {
-                            peer_loop(r.0, r.1, active_tx.clone());
+                        && let Some(h) = Global::accept_connection(stream, crate::fsm::Role::Passive).await {
+                            peer_loop(h, active_tx.clone());
                         }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
-                        && let Some(r) = Global::accept_connection(stream, crate::fsm::Role::Active).await {
-                            peer_loop(r.0, r.1, active_tx.clone());
+                        && let Some(h) = Global::accept_connection(stream, crate::fsm::Role::Active).await {
+                            peer_loop(h, active_tx.clone());
                         }
                 }
             }
@@ -3469,21 +3451,25 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
     })
 }
 
-fn peer_loop(
-    mut h: Handler,
-    mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
-    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
-) {
+fn peer_loop(mut h: Handler, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
     tokio::spawn(async move {
         let peer_addr = h.remote_addr;
-        let _ = h.run(mgmt_rx).await;
+        let role = h.role;
+        let _ = h.run().await;
         let mut server = GLOBAL.write().await;
         if let Some(peer) = server.peers.get_mut(&peer_addr) {
-            if peer.delete_on_disconnected {
-                server.peers.remove(&peer_addr);
-            } else {
-                peer.reset();
-                enable_active_connect(peer, active_conn_tx);
+            match role {
+                crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
+                crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
+            }
+            // Only reset and reconnect when no Handler remains for this peer.
+            if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
+                if peer.delete_on_disconnected {
+                    server.peers.remove(&peer_addr);
+                } else {
+                    peer.reset();
+                    enable_active_connect(peer, active_conn_tx);
+                }
             }
         }
     });
@@ -3508,9 +3494,9 @@ struct Handler {
 
     peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
     role: crate::fsm::Role,
-    /// Receives a CEASE Notification from the collision winner; when fired
-    /// this Handler is the loser and must send the message then close.
-    collision_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
+    /// Receives a CEASE Notification from an external signal (collision winner
+    /// or admin operation); on receipt this Handler sends the message and closes.
+    close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
 
     stream: Option<TcpStream>,
     source: Option<Arc<table::Source>>,
@@ -3529,7 +3515,7 @@ impl Handler {
         rs_client: bool,
         role: crate::fsm::Role,
         peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
-        collision_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
+        close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
@@ -3550,7 +3536,7 @@ impl Handler {
             rs_client,
             peer_fsm,
             role,
-            collision_rx,
+            close_rx,
             stream: Some(stream),
             source: None,
             peer_event_tx: Vec::new(),
@@ -3706,8 +3692,8 @@ impl Handler {
                             let mut global = GLOBAL.write().await;
                             if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
                                 match role {
-                                    crate::fsm::Role::Active => peer.active_collision_tx.0.take(),
-                                    crate::fsm::Role::Passive => peer.passive_collision_tx.0.take(),
+                                    crate::fsm::Role::Active => peer.active_close_tx.0.take(),
+                                    crate::fsm::Role::Passive => peer.passive_close_tx.0.take(),
                                 }
                             } else {
                                 None
@@ -4012,10 +3998,7 @@ impl Handler {
         Ok(())
     }
 
-    async fn run(
-        &mut self,
-        mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
-    ) -> Result<(), Error> {
+    async fn run(&mut self) -> Result<(), Error> {
         let mut stream = self.stream.take().unwrap();
         let remote_sockaddr = stream.peer_addr()?;
         let local_sockaddr = stream.local_addr()?;
@@ -4076,8 +4059,8 @@ impl Handler {
         )
         .await;
 
-        let mut collision_rx: futures::future::OptionFuture<_> =
-            self.collision_rx.take().map(|rx| rx.fuse()).into();
+        let mut close_rx: futures::future::OptionFuture<_> =
+            self.close_rx.take().map(|rx| rx.fuse()).into();
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
@@ -4097,12 +4080,7 @@ impl Handler {
             };
 
             futures::select_biased! {
-                msg = mgmt_rx.recv().fuse() => {
-                    if let Some(PeerMgmtMsg::Notification(msg)) = msg {
-                        urgent.insert(0, msg);
-                    }
-                }
-                cease = &mut collision_rx => {
+                cease = &mut close_rx => {
                     if let Some(Ok(msg)) = cease {
                         urgent.insert(0, msg);
                         self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
