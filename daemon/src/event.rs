@@ -2676,6 +2676,7 @@ impl Global {
 
     async fn accept_connection(
         stream: TcpStream,
+        role: crate::fsm::Role,
     ) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
         let local_sockaddr = stream.local_addr().ok()?;
         let remote_sockaddr = stream.peer_addr().ok()?;
@@ -2760,6 +2761,7 @@ impl Global {
             peer.local_cap.to_owned(),
             peer.holdtime,
             peer.route_server_client,
+            role,
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
@@ -3115,13 +3117,13 @@ impl Global {
             futures::select_biased! {
                 stream = bgp_listen_futures.next() => {
                     if let Some(Some(Ok(stream))) = stream
-                        && let Some(r) = Global::accept_connection(stream).await {
+                        && let Some(r) = Global::accept_connection(stream, crate::fsm::Role::Passive).await {
                             peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
-                        && let Some(r) = Global::accept_connection(stream).await {
+                        && let Some(r) = Global::accept_connection(stream, crate::fsm::Role::Active).await {
                             peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
@@ -3463,7 +3465,8 @@ struct Handler {
 
     rs_client: bool,
 
-    session: crate::fsm::Session,
+    peer_fsm: crate::fsm::PeerFsm,
+    role: crate::fsm::Role,
 
     stream: Option<TcpStream>,
     source: Option<Arc<table::Source>>,
@@ -3482,6 +3485,7 @@ impl Handler {
         local_cap: Vec<packet::Capability>,
         local_holdtime: u64,
         rs_client: bool,
+        role: crate::fsm::Role,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
@@ -3492,9 +3496,9 @@ impl Handler {
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
         let expected_remote_asn = state.remote_asn.load(Ordering::Relaxed);
-        let session = crate::fsm::Session::new(
-            local_asn,
+        let peer_fsm = crate::fsm::PeerFsm::new(
             u32::from(local_router_id),
+            local_asn,
             local_cap.clone(),
             local_holdtime,
             expected_remote_asn,
@@ -3510,7 +3514,8 @@ impl Handler {
             counter_rx,
             local_cap,
             rs_client,
-            session,
+            peer_fsm,
+            role,
             stream: Some(stream),
             source: None,
             peer_event_tx: Vec::new(),
@@ -3556,7 +3561,12 @@ impl Handler {
 
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
-                let effective_max = self.session.send_max().get(f).copied().unwrap_or(1);
+                let effective_max = self
+                    .peer_fsm
+                    .session(self.role)
+                    .and_then(|s| s.send_max().get(f))
+                    .copied()
+                    .unwrap_or(1);
                 for mut c in t.rtable.best(f).into_iter() {
                     if c.rank > effective_max {
                         continue;
@@ -3640,7 +3650,7 @@ impl Handler {
 
     async fn apply_outputs(
         &mut self,
-        outputs: Vec<crate::fsm::Output>,
+        outputs: Vec<crate::fsm::PeerFsmOutput>,
         urgent: &mut Vec<bgp::Message>,
         framer: &mut BgpFramer,
         keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
@@ -3651,20 +3661,26 @@ impl Handler {
     ) {
         for output in outputs {
             match output {
-                crate::fsm::Output::SendMessage(m) => {
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SendMessage(m)) => {
                     urgent.push(m);
                 }
-                crate::fsm::Output::SetKeepaliveTimer(secs) => {
+                crate::fsm::PeerFsmOutput::Session(
+                    _,
+                    crate::fsm::Output::SetKeepaliveTimer(secs),
+                ) => {
                     *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
-                crate::fsm::Output::SetHoldTimer(secs) => {
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SetHoldTimer(secs)) => {
                     *holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
-                crate::fsm::Output::ChannelsNegotiated(channels) => {
+                crate::fsm::PeerFsmOutput::Session(
+                    _,
+                    crate::fsm::Output::ChannelsNegotiated(channels),
+                ) => {
                     // Log Add-Path warnings for locally configured but not negotiated families
                     let local_addpath: Vec<(Family, u8)> = self
                         .local_cap
@@ -3704,12 +3720,15 @@ impl Handler {
                     }
                     framer.inner_mut().channel = channels;
                 }
-                crate::fsm::Output::SessionEstablished {
-                    remote_asn,
-                    remote_id,
-                    remote_holdtime,
-                    remote_capabilities,
-                } => {
+                crate::fsm::PeerFsmOutput::Session(
+                    _,
+                    crate::fsm::Output::SessionEstablished {
+                        remote_asn,
+                        remote_id,
+                        remote_holdtime,
+                        remote_capabilities,
+                    },
+                ) => {
                     self.state.remote_asn.store(remote_asn, Ordering::Relaxed);
                     self.state.remote_id.store(remote_id, Ordering::Relaxed);
                     self.state
@@ -3721,7 +3740,7 @@ impl Handler {
                     self.on_established(framer.inner(), local_sockaddr, remote_sockaddr, pending)
                         .await;
                 }
-                crate::fsm::Output::SessionDown(reason) => {
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(reason)) => {
                     self.shutdown = Some(match reason {
                         crate::fsm::SessionDownReason::HoldTimerExpired => {
                             bmp::PeerDownReason::LocalFsm(0)
@@ -3740,12 +3759,18 @@ impl Handler {
                         }
                     });
                 }
-                crate::fsm::Output::StateChanged(s) => {
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
                 }
-                crate::fsm::Output::RouteRefresh(family) => {
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::RouteRefresh(family)) => {
                     // TODO: re-advertise full RIB-Out for `family` to this peer.
                     let _ = family;
+                }
+                crate::fsm::PeerFsmOutput::CloseConnection(_) => {
+                    self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
+                }
+                crate::fsm::PeerFsmOutput::StopActiveConnect => {
+                    // TODO: cancel active connection retry timer.
                 }
             }
         }
@@ -3813,9 +3838,15 @@ impl Handler {
             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
         }
         if any_update_pending {
-            let outputs = self.session.process(crate::fsm::Input::UpdateSent);
+            let outputs = self
+                .peer_fsm
+                .process(self.role, crate::fsm::Input::UpdateSent);
             for output in outputs {
-                if let crate::fsm::Output::SetKeepaliveTimer(secs) = output {
+                if let crate::fsm::PeerFsmOutput::Session(
+                    _,
+                    crate::fsm::Output::SetKeepaliveTimer(secs),
+                ) = output
+                {
                     *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
@@ -3887,11 +3918,14 @@ impl Handler {
         };
 
         let outputs = self
-            .session
-            .process(crate::fsm::Input::MessageReceived(msg));
-        let has_session_down = outputs
-            .iter()
-            .any(|o| matches!(o, crate::fsm::Output::SessionDown(_)));
+            .peer_fsm
+            .process(self.role, crate::fsm::Input::MessageReceived(msg));
+        let has_session_down = outputs.iter().any(|o| {
+            matches!(
+                o,
+                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(_))
+            )
+        });
         self.apply_outputs(
             outputs,
             urgent,
@@ -3909,7 +3943,7 @@ impl Handler {
             if has_session_down {
                 return Err(Error::Packet(
                     rustybgp_packet::BgpError::FsmUnexpectedState {
-                        state: u8::from(self.session.state()),
+                        state: u8::from(self.peer_fsm.state(self.role)),
                     }
                     .into(),
                 ));
@@ -3967,7 +4001,9 @@ impl Handler {
                 .collect();
 
         // Kick off the OPEN exchange via the FSM.
-        let outputs = self.session.process(crate::fsm::Input::Connected);
+        let outputs = self
+            .peer_fsm
+            .process(self.role, crate::fsm::Input::Connected);
         self.apply_outputs(
             outputs,
             &mut urgent,
@@ -4006,18 +4042,18 @@ impl Handler {
                 }
                 _ = holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
-                    let outputs = self.session.process(crate::fsm::Input::HoldTimerExpired);
+                    let outputs = self.peer_fsm.process(self.role, crate::fsm::Input::HoldTimerExpired);
                     self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 _ = keepalive_futures.next() => {
-                    let outputs = self.session.process(crate::fsm::Input::KeepaliveTimerExpired);
+                    let outputs = self.peer_fsm.process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                if self.session.state() != SessionState::Established {
+                                if self.peer_fsm.state(self.role) != SessionState::Established {
                                     continue;
                                 }
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
@@ -4028,11 +4064,19 @@ impl Handler {
                                 }
                                 // Filter changes that exceed this peer's effective send_max.
                                 // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
-                                let effective_max = self.session.send_max().get(&ri.family).copied().unwrap_or(1);
+                                let effective_max = self
+                                    .peer_fsm
+                                    .session(self.role)
+                                    .and_then(|s| s.send_max().get(&ri.family))
+                                    .copied()
+                                    .unwrap_or(1);
                                 if ri.rank > effective_max {
                                     // Only withdraw if the path was previously within
                                     // this peer's window (old_rank <= effective_max).
-                                    if self.session.send_max().contains_key(&ri.family)
+                                    if self
+                                        .peer_fsm
+                                        .session(self.role)
+                                        .is_some_and(|s| s.send_max().contains_key(&ri.family))
                                         && ri.old_rank > 0
                                         && ri.old_rank <= effective_max
                                     {

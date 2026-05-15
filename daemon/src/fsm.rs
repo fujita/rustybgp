@@ -485,6 +485,11 @@ impl PeerFsm {
         }
     }
 
+    /// Current FSM state for the given role, or Idle if no session exists.
+    pub(crate) fn state(&self, role: Role) -> State {
+        self.session(role).map(|s| s.state()).unwrap_or(State::Idle)
+    }
+
     /// Mutable reference to the Session for the given role.
     pub(crate) fn session_mut(&mut self, role: Role) -> Option<&mut Session> {
         match role {
