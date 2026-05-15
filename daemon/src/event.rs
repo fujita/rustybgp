@@ -170,6 +170,9 @@ impl Clone for CloseTx {
 struct PeerConfig {
     remote_addr: IpAddr,
     remote_port: u16,
+    /// Expected AS number from configuration; 0 means "accept any".
+    /// The actual negotiated ASN lives in PeerState.remote_asn (session-scoped).
+    remote_asn: u32,
     local_asn: u32,
     passive: bool,
     delete_on_disconnected: bool,
@@ -234,6 +237,7 @@ impl Peer {
                 .as_secs(),
             Ordering::Relaxed,
         );
+        self.state.remote_asn.store(0, Ordering::Relaxed);
         self.state.remote_cap.store(None);
         self.state.remote_id.store(0, Ordering::Relaxed);
         self.state.remote_holdtime.store(0, Ordering::Relaxed);
@@ -434,6 +438,7 @@ impl PeerBuilder {
                 } else {
                     Global::BGP_PORT
                 },
+                remote_asn: self.remote_asn,
                 local_asn: self.local_asn,
                 passive: self.passive,
                 delete_on_disconnected: self.delete_on_disconnected,
@@ -453,7 +458,7 @@ impl PeerBuilder {
                 fsm: AtomicU8::new(self.state as u8),
                 uptime: AtomicU64::new(0),
                 downtime: AtomicU64::new(0),
-                remote_asn: AtomicU32::new(self.remote_asn),
+                remote_asn: AtomicU32::new(0),
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
@@ -482,7 +487,7 @@ impl From<&Peer> for api::Peer {
             .unwrap_or_default();
         let mut ps = api::PeerState {
             neighbor_address: p.config.remote_addr.to_string(),
-            peer_asn: p.state.remote_asn.load(Ordering::Relaxed),
+            peer_asn: p.config.remote_asn,
             local_asn: p.config.local_asn,
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
@@ -2717,7 +2722,7 @@ impl Global {
             peer.config.local_asn,
             peer.config.local_cap.clone(),
             peer.config.holdtime,
-            peer.state.remote_asn.load(Ordering::Relaxed),
+            peer.config.remote_asn,
             peer.config.send_max.clone(),
         ))));
         if peer.admin_down {
@@ -2806,7 +2811,7 @@ async fn accept_connection(
         }
     };
     if let Some(ttl) = peer.config.multihop_ttl {
-        if peer.state.remote_asn.load(Ordering::Relaxed) != peer.config.local_asn {
+        if peer.config.remote_asn != peer.config.local_asn {
             let _ = stream.set_ttl(ttl.into());
         }
     } else {
