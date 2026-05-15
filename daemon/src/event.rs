@@ -31,7 +31,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
@@ -756,6 +755,7 @@ struct GrpcService {
     local_source: Arc<table::Source>,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
     global: GlobalHandle,
+    tables: TableHandle,
 }
 
 impl GrpcService {
@@ -763,6 +763,7 @@ impl GrpcService {
         init: Arc<tokio::sync::Notify>,
         active_conn_tx: mpsc::UnboundedSender<TcpStream>,
         global: GlobalHandle,
+        tables: TableHandle,
     ) -> Self {
         GrpcService {
             init,
@@ -781,6 +782,7 @@ impl GrpcService {
             )),
             active_conn_tx,
             global,
+            tables,
         }
     }
 
@@ -828,7 +830,7 @@ impl GrpcService {
             }
         }
         Ok((
-            Table::dealer(net),
+            self.tables.dealer(net),
             TableEvent::PassUpdate(
                 self.local_source.clone(),
                 family,
@@ -973,8 +975,8 @@ impl GoBgpService for GrpcService {
             .map(|(a, p)| (*a, p.clone()))
             .collect();
 
-        for i in 0..*NUM_TABLES {
-            let t = TABLE[i].lock().await;
+        for i in 0..self.tables.shards.len() {
+            let t = self.tables.shards[i].lock().await;
             for (peer_addr, peer) in &mut peers {
                 if let Some(m) = t.rtable.peer_stats(peer_addr) {
                     peer.update_stats(m.collect());
@@ -1104,11 +1106,12 @@ impl GoBgpService for GrpcService {
         let (bmp_tx, bmp_rx) = mpsc::unbounded_channel();
 
         if let Some(sockaddr) = request.remote_addr() {
-            for i in 0..*NUM_TABLES {
-                let mut t = TABLE[i].lock().await;
+            for i in 0..self.tables.shards.len() {
+                let mut t = self.tables.shards[i].lock().await;
                 t.bmp_event_tx.insert(sockaddr, bmp_tx.clone());
             }
 
+            let tables = self.tables.clone();
             let (tx, rx) = mpsc::channel(1024);
             tokio::spawn(async move {
                 let mut bmp_rx = UnboundedReceiverStream::new(bmp_rx);
@@ -1191,8 +1194,8 @@ impl GoBgpService for GrpcService {
                         _ => {}
                     }
                 }
-                for i in 0..*NUM_TABLES {
-                    let mut t = TABLE[i].lock().await;
+                for i in 0..tables.shards.len() {
+                    let mut t = tables.shards[i].lock().await;
                     t.bmp_event_tx.remove(&sockaddr);
                 }
             });
@@ -1312,7 +1315,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        TABLE[u.0].lock().await.event(u.1);
+        self.tables.event(u.0, u.1).await;
 
         // FIXME: support uuid
         Ok(tonic::Response::new(api::AddPathResponse {
@@ -1324,7 +1327,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        TABLE[u.0].lock().await.event(u.1);
+        self.tables.event(u.0, u.1).await;
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -1382,12 +1385,12 @@ impl GoBgpService for GrpcService {
 
         let mut v = Vec::new();
         let pa = if table_type == table::TableType::AdjOut {
-            GLOBAL_EXPORT_POLICY.load_full()
+            self.tables.export_policy.load_full()
         } else {
             None
         };
-        for i in 0..*NUM_TABLES {
-            let t = TABLE[i].lock().await;
+        for i in 0..self.tables.shards.len() {
+            let t = self.tables.shards[i].lock().await;
             for d in t.rtable.iter_destinations(
                 table_type,
                 family,
@@ -1421,8 +1424,7 @@ impl GoBgpService for GrpcService {
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
                 if let Ok(u) = self.local_path(path) {
-                    let mut t = TABLE[u.0].lock().await;
-                    t.event(u.1);
+                    self.tables.event(u.0, u.1).await;
                 }
             }
         }
@@ -1438,8 +1440,8 @@ impl GoBgpService for GrpcService {
             None => Family::IPV4,
         };
         let mut info = table::RoutingTableState::default();
-        for i in 0..*NUM_TABLES {
-            let t = TABLE[i].lock().await;
+        for i in 0..self.tables.shards.len() {
+            let t = self.tables.shards[i].lock().await;
             info += t.rtable.state(family);
         }
         Ok(tonic::Response::new(convert::routing_table_state_to_api(
@@ -1657,7 +1659,7 @@ impl GoBgpService for GrpcService {
             .into_inner()
             .assignment
             .ok_or(Error::EmptyArgument)?;
-        add_policy_assignment(request, self.global.clone()).await?;
+        add_policy_assignment(request, self.global.clone(), self.tables.clone()).await?;
         Ok(tonic::Response::new(api::AddPolicyAssignmentResponse {}))
     }
     async fn delete_policy_assignment(
@@ -1728,7 +1730,7 @@ impl GoBgpService for GrpcService {
                 let client = RpkiClient::new();
                 let t = client.configured_time;
                 v.insert(client);
-                RpkiClient::try_connect(sockaddr, t, self.global.clone());
+                RpkiClient::try_connect(sockaddr, t, self.global.clone(), self.tables.clone());
             }
         }
         Ok(tonic::Response::new(api::AddRpkiResponse {}))
@@ -1776,7 +1778,7 @@ impl GoBgpService for GrpcService {
         }
 
         {
-            let t = TABLE[0].lock().await;
+            let t = self.tables.shards[0].lock().await;
             for (addr, r) in v.iter_mut() {
                 let s = t.rtable.rpki_state(addr);
                 r.state.as_mut().unwrap().record_ipv4 = s.num_records_v4;
@@ -1831,7 +1833,7 @@ impl GoBgpService for GrpcService {
             None => Family::IPV4,
         };
 
-        let v: Vec<api::ListRpkiTableResponse> = TABLE[0]
+        let v: Vec<api::ListRpkiTableResponse> = self.tables.shards[0]
             .lock()
             .await
             .rtable
@@ -1892,8 +1894,9 @@ impl GoBgpService for GrpcService {
             }
         };
         let global = self.global.clone();
+        let tables = self.tables.clone();
         tokio::spawn(async move {
-            if let Err(e) = d.serve(file, global).await {
+            if let Err(e) = d.serve(file, global, tables).await {
                 println!("mrt dumper failed: {:?}", e);
             }
         });
@@ -1932,7 +1935,7 @@ impl GoBgpService for GrpcService {
                 let client = BmpClient::new();
                 let t = client.configured_time;
                 v.insert(client);
-                BmpClient::try_connect(sockaddr, t, self.global.clone());
+                BmpClient::try_connect(sockaddr, t, self.global.clone(), self.tables.clone());
             }
         }
         Ok(tonic::Response::new(api::AddBmpResponse {}))
@@ -1996,6 +1999,7 @@ impl GoBgpService for GrpcService {
 async fn add_policy_assignment(
     req: api::PolicyAssignment,
     global: GlobalHandle,
+    tables: TableHandle,
 ) -> Result<(), Error> {
     let (name, direction, default_action, policy_names) = convert::policy_assignment_from_api(req)?;
     let (dir, assignment) = global.write().await.ptable.add_assignment(
@@ -2005,9 +2009,9 @@ async fn add_policy_assignment(
         policy_names,
     )?;
     if dir == table::PolicyDirection::Import {
-        GLOBAL_IMPORT_POLICY.store(Some(Arc::clone(&assignment)));
+        tables.import_policy.store(Some(Arc::clone(&assignment)));
     } else {
-        GLOBAL_EXPORT_POLICY.store(Some(Arc::clone(&assignment)));
+        tables.export_policy.store(Some(Arc::clone(&assignment)));
     }
     Ok(())
 }
@@ -2087,17 +2091,18 @@ impl MrtDumper {
         &mut self,
         mut file: tokio::fs::File,
         global: GlobalHandle,
+        tables: TableHandle,
     ) -> Result<(), Error> {
         let (tx, rx) = mpsc::unbounded_channel();
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
+        for i in 0..tables.shards.len() {
+            let mut t = tables.shards[i].lock().await;
             t.mrt_event_tx.insert(self.filename.clone(), tx.clone());
         }
 
         let result = self.run_loop(&mut file, rx).await;
 
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
+        for i in 0..tables.shards.len() {
+            let mut t = tables.shards[i].lock().await;
             t.mrt_event_tx.remove(&self.filename);
         }
         global.write().await.mrt_filenames.remove(&self.filename);
@@ -2159,7 +2164,12 @@ impl BmpClient {
         }
     }
 
-    async fn serve(stream: TcpStream, sockaddr: SocketAddr, global: GlobalHandle) {
+    async fn serve(
+        stream: TcpStream,
+        sockaddr: SocketAddr,
+        global: GlobalHandle,
+        tables: TableHandle,
+    ) {
         let mut lines = Framed::new(stream, bmp::BmpCodec::new());
         let sysname = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("unknown"));
         let _ = lines
@@ -2190,8 +2200,8 @@ impl BmpClient {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let mut adjin = FnvHashMap::default();
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
+        for i in 0..tables.shards.len() {
+            let mut t = tables.shards[i].lock().await;
             t.bmp_event_tx.insert(sockaddr, tx.clone());
             for f in &[Family::IPV4, Family::IPV6] {
                 for c in t.rtable.iter_reach(*f) {
@@ -2315,13 +2325,18 @@ impl BmpClient {
                 }
             }
         }
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
+        for i in 0..tables.shards.len() {
+            let mut t = tables.shards[i].lock().await;
             let _ = t.bmp_event_tx.remove(&sockaddr);
         }
     }
 
-    fn try_connect(sockaddr: SocketAddr, configured_time: u64, global: GlobalHandle) {
+    fn try_connect(
+        sockaddr: SocketAddr,
+        configured_time: u64,
+        global: GlobalHandle,
+        tables: TableHandle,
+    ) {
         tokio::spawn(async move {
             loop {
                 if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2338,7 +2353,7 @@ impl BmpClient {
                     } else {
                         break;
                     }
-                    BmpClient::serve(stream, sockaddr, global.clone()).await;
+                    BmpClient::serve(stream, sockaddr, global.clone(), tables.clone()).await;
                     if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
                         client.downtime = SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2473,6 +2488,7 @@ impl RpkiClient {
         stream: TcpStream,
         rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
         state: Arc<RpkiState>,
+        tables: TableHandle,
     ) -> Result<(), Error> {
         let remote_addr = stream.peer_addr()?.ip();
         let remote_addr = Arc::new(remote_addr);
@@ -2511,9 +2527,8 @@ impl RpkiClient {
                         {
                             let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
                             if end_of_data {
-                                for i in 0..*NUM_TABLES {
-                                    let mut t = TABLE[i].lock().await;
-                                    t.event(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
+                                for i in 0..tables.shards.len() {
+                                    tables.event(i, TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())])).await;
                                 }
                             } else {
                                 v.push((
@@ -2525,10 +2540,9 @@ impl RpkiClient {
                         rpki::Message::EndOfData { serial_number } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            for i in 0..*NUM_TABLES {
-                                let mut t = TABLE[i].lock().await;
-                                t.event(TableEvent::Drop(remote_addr.clone()));
-                                t.event(TableEvent::InsertRoa(v.to_owned()));
+                            for i in 0..tables.shards.len() {
+                                tables.event(i, TableEvent::Drop(remote_addr.clone())).await;
+                                tables.event(i, TableEvent::InsertRoa(v.to_owned())).await;
                             }
                         }
                         _ => {}
@@ -2543,14 +2557,18 @@ impl RpkiClient {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
-            t.event(TableEvent::Drop(remote_addr.clone()));
+        for i in 0..tables.shards.len() {
+            tables.event(i, TableEvent::Drop(remote_addr.clone())).await;
         }
         Ok(())
     }
 
-    fn try_connect(sockaddr: SocketAddr, configured_time: u64, global: GlobalHandle) {
+    fn try_connect(
+        sockaddr: SocketAddr,
+        configured_time: u64,
+        global: GlobalHandle,
+        tables: TableHandle,
+    ) {
         tokio::spawn(async move {
             loop {
                 if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2568,7 +2586,7 @@ impl RpkiClient {
                     } else {
                         break;
                     };
-                    let _ = RpkiClient::serve(stream, rx, state).await;
+                    let _ = RpkiClient::serve(stream, rx, state, tables.clone()).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
@@ -2610,25 +2628,6 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
 
     Ok(sock.into())
 }
-
-static NUM_TABLES: LazyLock<usize> = LazyLock::new(num_cpus::get);
-static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
-static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
-static KERNEL_TX: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>> =
-    ArcSwapOption::const_empty();
-static TABLE: LazyLock<Vec<Mutex<Table>>> = LazyLock::new(|| {
-    let mut table = Vec::with_capacity(*NUM_TABLES);
-    for _ in 0..*NUM_TABLES {
-        table.push(Mutex::new(Table {
-            rtable: table::RoutingTable::new(),
-            peer_event_tx: FnvHashMap::default(),
-            bmp_event_tx: FnvHashMap::default(),
-            mrt_event_tx: FnvHashMap::default(),
-            addpath: FnvHashMap::default(),
-        }));
-    }
-    table
-});
 
 type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
 
@@ -2733,6 +2732,7 @@ impl Global {
         stream: TcpStream,
         role: crate::fsm::Role,
         global: GlobalHandle,
+        tables: TableHandle,
     ) -> Option<Handler> {
         let local_sockaddr = stream.local_addr().ok()?;
         let remote_sockaddr = stream.peer_addr().ok()?;
@@ -2826,6 +2826,7 @@ impl Global {
             peer.counter_rx.clone(),
             peer.prefix_limits.clone(),
             global,
+            tables,
         )
     }
 
@@ -2836,6 +2837,7 @@ impl Global {
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
         let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new()));
+        let tables: TableHandle = Arc::new(Tables::new(num_cpus::get()));
         let global_config = bgp
             .as_ref()
             .and_then(|x| x.global.as_ref())
@@ -2880,8 +2882,9 @@ impl Global {
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
                                 let global2 = global.clone();
+                                let tables2 = tables.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = d.serve(file, global2).await {
+                                    if let Err(e) = d.serve(file, global2, tables2).await {
                                         println!("mrt dumper failed: {:?}", e);
                                     }
                                 });
@@ -2929,7 +2932,7 @@ impl Global {
                             }
                         }
                     });
-                    KERNEL_TX.store(Some(Arc::new(tx)));
+                    tables.kernel_tx.store(Some(Arc::new(tx)));
                     println!("kernel route integration enabled");
                 }
                 Err(e) => {
@@ -2994,7 +2997,7 @@ impl Global {
                         let client = BmpClient::new();
                         let t = client.configured_time;
                         v.insert(client);
-                        BmpClient::try_connect(sockaddr, t, global.clone());
+                        BmpClient::try_connect(sockaddr, t, global.clone(), tables.clone());
                     }
                 }
             }
@@ -3077,6 +3080,7 @@ impl Global {
                         config.default_import_policy.as_ref(),
                     ),
                     global.clone(),
+                    tables.clone(),
                 )
                 .await
                 {
@@ -3089,6 +3093,7 @@ impl Global {
                         config.default_export_policy.as_ref(),
                     ),
                     global.clone(),
+                    tables.clone(),
                 )
                 .await
                 {
@@ -3137,10 +3142,11 @@ impl Global {
         let notify2 = notify.clone();
         let active_tx2 = active_tx.clone();
         let global2 = global.clone();
+        let tables2 = tables.clone();
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(GoBgpServiceServer::new(GrpcService::new(
-                    notify2, active_tx2, global2,
+                    notify2, active_tx2, global2, tables2,
                 )))
                 .serve(addr)
                 .await
@@ -3187,7 +3193,7 @@ impl Global {
                 stream = bgp_listen_futures.next() => {
                     if let Some(Some(Ok(stream))) = stream {
                         let mut g = global.write().await;
-                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Passive, global.clone()).await {
+                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Passive, global.clone(), tables.clone()).await {
                             drop(g);
                             peer_loop(h, global.clone(), active_tx.clone());
                         }
@@ -3196,7 +3202,7 @@ impl Global {
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream {
                         let mut g = global.write().await;
-                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Active, global.clone()).await {
+                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Active, global.clone(), tables.clone()).await {
                             drop(g);
                             peer_loop(h, global.clone(), active_tx.clone());
                         }
@@ -3234,6 +3240,54 @@ enum TableEvent {
     Drop(Arc<IpAddr>),
 }
 
+type TableHandle = Arc<Tables>;
+
+struct Tables {
+    shards: Vec<Mutex<Table>>,
+    kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
+    import_policy: ArcSwapOption<table::PolicyAssignment>,
+    export_policy: ArcSwapOption<table::PolicyAssignment>,
+}
+
+impl Tables {
+    fn new(num_shards: usize) -> Self {
+        Tables {
+            shards: (0..num_shards)
+                .map(|_| {
+                    Mutex::new(Table {
+                        rtable: table::RoutingTable::new(),
+                        peer_event_tx: FnvHashMap::default(),
+                        bmp_event_tx: FnvHashMap::default(),
+                        mrt_event_tx: FnvHashMap::default(),
+                        addpath: FnvHashMap::default(),
+                    })
+                })
+                .collect(),
+            kernel_tx: ArcSwapOption::const_empty(),
+            import_policy: ArcSwapOption::const_empty(),
+            export_policy: ArcSwapOption::const_empty(),
+        }
+    }
+
+    fn dealer<T: Hash>(&self, a: T) -> usize {
+        let mut hasher = FnvHasher::default();
+        a.hash(&mut hasher);
+        hasher.finish() as usize % self.shards.len()
+    }
+
+    async fn event(&self, idx: usize, msg: TableEvent) {
+        let import_policy = self.import_policy.load_full();
+        let export_policy = self.export_policy.load_full();
+        let kernel_tx = self.kernel_tx.load_full();
+        self.shards[idx].lock().await.event(
+            msg,
+            kernel_tx.as_deref(),
+            import_policy.as_deref(),
+            export_policy.as_deref(),
+        );
+    }
+}
+
 struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
@@ -3243,12 +3297,6 @@ struct Table {
 }
 
 impl Table {
-    fn dealer<T: Hash>(a: T) -> usize {
-        let mut hasher = FnvHasher::default();
-        a.hash(&mut hasher);
-        hasher.finish() as usize % *NUM_TABLES
-    }
-
     fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
         self.addpath.get(addr).is_some_and(|e| e.contains(family))
     }
@@ -3360,11 +3408,37 @@ impl Table {
     fn distribute_changes(
         &self,
         changes: Vec<table::Change>,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
         export_policy: Option<&table::PolicyAssignment>,
     ) {
         for c in &changes {
-            if c.rank == 1 {
-                send_kernel_route(c);
+            if c.rank == 1
+                && let Some(tx) = kernel_tx
+            {
+                let (dst, prefix_len) = match c.net {
+                    packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
+                    packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
+                    // MUP NLRI do not map to kernel routes; skip them here.
+                    packet::Nlri::Mup(_) => continue,
+                };
+                if c.attr.is_empty() {
+                    let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                } else {
+                    let nexthop = c.nexthop.addr();
+                    if matches!(
+                        (dst, nexthop),
+                        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+                    ) {
+                        let _ = tx.send(KernelRouteEvent::Install {
+                            dst,
+                            prefix_len,
+                            nexthop,
+                        });
+                    } else {
+                        // Family mismatch (e.g., RFC 8950); withdraw to avoid stale kernel route.
+                        let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                    }
+                }
             }
         }
         for c in crate::policy::filter_export(changes, export_policy, &self.rtable) {
@@ -3374,7 +3448,13 @@ impl Table {
         }
     }
 
-    fn event(&mut self, msg: TableEvent) {
+    fn event(
+        &mut self,
+        msg: TableEvent,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        import_policy: Option<&table::PolicyAssignment>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
         match msg {
             TableEvent::PassUpdate(source, family, nets, attrs, nexthop) => {
                 self.send_bmp_update(&source, family, &nets, attrs.as_ref(), nexthop);
@@ -3382,12 +3462,10 @@ impl Table {
 
                 match attrs {
                     Some(attrs) => {
-                        let import_policy = GLOBAL_IMPORT_POLICY.load();
-                        let export_policy = GLOBAL_EXPORT_POLICY.load();
                         for net in nets {
                             let mut nh = nexthop.unwrap();
                             let filtered = crate::policy::apply_import(
-                                import_policy.as_deref(),
+                                import_policy,
                                 &self.rtable,
                                 &source,
                                 &net.nlri,
@@ -3403,23 +3481,22 @@ impl Table {
                                 attrs.clone(),
                                 filtered,
                             );
-                            self.distribute_changes(changes, export_policy.as_deref());
+                            self.distribute_changes(changes, kernel_tx, export_policy);
                         }
                     }
                     None => {
-                        let export_policy = GLOBAL_EXPORT_POLICY.load();
                         for net in nets {
                             let changes =
                                 self.rtable
                                     .remove(source.clone(), family, net.nlri, net.path_id);
-                            self.distribute_changes(changes, export_policy.as_deref());
+                            self.distribute_changes(changes, kernel_tx, export_policy);
                         }
                     }
                 }
             }
             TableEvent::Disconnected(source) => {
                 let changes = self.rtable.drop(source.clone());
-                self.distribute_changes(changes, None);
+                self.distribute_changes(changes, kernel_tx, None);
             }
             TableEvent::InsertRoa(v) => {
                 for (net, roa) in v {
@@ -3429,37 +3506,6 @@ impl Table {
             TableEvent::Drop(addr) => {
                 self.rtable.rpki_drop(addr);
             }
-        }
-    }
-}
-
-fn send_kernel_route(change: &table::Change) {
-    let guard = KERNEL_TX.load();
-    let Some(tx) = guard.as_ref() else {
-        return;
-    };
-    let (dst, prefix_len) = match change.net {
-        packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
-        packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
-        // MUP NLRI do not map to kernel routes; skip them here.
-        packet::Nlri::Mup(_) => return,
-    };
-    if change.attr.is_empty() {
-        let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
-    } else {
-        let nexthop = change.nexthop.addr();
-        if matches!(
-            (dst, nexthop),
-            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-        ) {
-            let _ = tx.send(KernelRouteEvent::Install {
-                dst,
-                prefix_len,
-                nexthop,
-            });
-        } else {
-            // Family mismatch (e.g., RFC 8950); withdraw to avoid stale kernel route.
-            let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
         }
     }
 }
@@ -3561,6 +3607,7 @@ struct Handler {
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
     global: GlobalHandle,
+    tables: TableHandle,
 }
 
 impl Handler {
@@ -3578,6 +3625,7 @@ impl Handler {
         counter_rx: Arc<MessageCounter>,
         prefix_limits: FnvHashMap<Family, u32>,
         global: GlobalHandle,
+        tables: TableHandle,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -3601,6 +3649,7 @@ impl Handler {
             shutdown: None,
             prefix_limits,
             global,
+            tables,
         })
     }
 
@@ -3635,9 +3684,9 @@ impl Handler {
             pending.insert(*family, crate::peer_tx::PendingTx::new(c.addpath_tx()));
         }
 
-        let export_policy = GLOBAL_EXPORT_POLICY.load_full();
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
+        let export_policy = self.tables.export_policy.load_full();
+        for i in 0..self.tables.shards.len() {
+            let mut t = self.tables.shards[i].lock().await;
 
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
@@ -3969,29 +4018,37 @@ impl Handler {
         if let Some(s) = reach {
             let family = s.family;
             for net in s.entries {
-                let idx = Table::dealer(net.nlri);
-                let mut t = TABLE[idx].lock().await;
-                t.event(TableEvent::PassUpdate(
-                    self.source.as_ref().unwrap().clone(),
-                    family,
-                    vec![net],
-                    Some(attr.clone()),
-                    nexthop,
-                ));
+                let idx = self.tables.dealer(net.nlri);
+                self.tables
+                    .event(
+                        idx,
+                        TableEvent::PassUpdate(
+                            self.source.as_ref().unwrap().clone(),
+                            family,
+                            vec![net],
+                            Some(attr.clone()),
+                            nexthop,
+                        ),
+                    )
+                    .await;
             }
         }
         if let Some(s) = unreach {
             let family = s.family;
             for net in s.entries {
-                let idx = Table::dealer(net.nlri);
-                let mut t = TABLE[idx].lock().await;
-                t.event(TableEvent::PassUpdate(
-                    self.source.as_ref().unwrap().clone(),
-                    family,
-                    vec![net],
-                    None,
-                    None,
-                ));
+                let idx = self.tables.dealer(net.nlri);
+                self.tables
+                    .event(
+                        idx,
+                        TableEvent::PassUpdate(
+                            self.source.as_ref().unwrap().clone(),
+                            family,
+                            vec![net],
+                            None,
+                            None,
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -4085,7 +4142,7 @@ impl Handler {
         let mut framer = BgpFramer::new(builder.build());
 
         let mut peer_event_rx = Vec::new();
-        for _ in 0..*NUM_TABLES {
+        for _ in 0..self.tables.shards.len() {
             let (tx, rx) = mpsc::unbounded_channel();
             self.peer_event_tx.push(tx);
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
@@ -4257,11 +4314,19 @@ impl Handler {
             // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
         if let Some(source) = self.source.take() {
-            for i in 0..*NUM_TABLES {
-                let mut t = TABLE[i].lock().await;
+            let import_policy = self.tables.import_policy.load_full();
+            let export_policy = self.tables.export_policy.load_full();
+            let kernel_tx = self.tables.kernel_tx.load_full();
+            for i in 0..self.tables.shards.len() {
+                let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
-                t.event(TableEvent::Disconnected(source.clone()));
+                t.event(
+                    TableEvent::Disconnected(source.clone()),
+                    kernel_tx.as_deref(),
+                    import_policy.as_deref(),
+                    export_policy.as_deref(),
+                );
                 let reason = self
                     .shutdown
                     .take()
