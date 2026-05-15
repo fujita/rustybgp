@@ -167,19 +167,31 @@ impl Clone for CloseTx {
 }
 
 #[derive(Clone)]
-struct Peer {
+struct PeerConfig {
     remote_addr: IpAddr,
     remote_port: u16,
     local_asn: u32,
     passive: bool,
-    admin_down: bool,
     delete_on_disconnected: bool,
+    holdtime: u64,
+    connect_retry_time: u64,
+    local_cap: Vec<packet::Capability>,
+    route_server_client: bool,
+    multihop_ttl: Option<u8>,
+    password: Option<String>,
+    /// Per-family send_max for Add-Path TX (RFC 7911).
+    send_max: FnvHashMap<Family, usize>,
+    /// Per-family prefix limits from config.
+    prefix_limits: FnvHashMap<Family, u32>,
+}
+
+#[derive(Clone)]
+struct Peer {
+    config: PeerConfig,
+    admin_down: bool,
 
     remote_sockaddr: SocketAddr,
     local_sockaddr: SocketAddr,
-
-    holdtime: u64,
-    connect_retry_time: u64,
 
     state: Arc<PeerState>,
 
@@ -189,16 +201,6 @@ struct Peer {
     // received and accepted
     route_stats: FnvHashMap<Family, (u64, u64)>,
 
-    local_cap: Vec<packet::Capability>,
-
-    route_server_client: bool,
-    multihop_ttl: Option<u8>,
-    password: Option<String>,
-
-    /// Per-family send_max for Add-Path TX (RFC 7911).
-    send_max: FnvHashMap<Family, usize>,
-    /// Per-family prefix limits from config.
-    prefix_limits: FnvHashMap<Family, u32>,
     /// Shared FSM for this peer; active and passive Connections for the same peer
     /// share one instance so collision detection sees both sessions.
     ///
@@ -425,20 +427,28 @@ impl PeerBuilder {
             }
         }
         Peer {
-            remote_addr: self.remote_addr,
-            remote_port: if self.remote_port != 0 {
-                self.remote_port
-            } else {
-                Global::BGP_PORT
+            config: PeerConfig {
+                remote_addr: self.remote_addr,
+                remote_port: if self.remote_port != 0 {
+                    self.remote_port
+                } else {
+                    Global::BGP_PORT
+                },
+                local_asn: self.local_asn,
+                passive: self.passive,
+                delete_on_disconnected: self.delete_on_disconnected,
+                holdtime: self.holdtime,
+                connect_retry_time: self.connect_retry_time,
+                local_cap: self.local_cap.split_off(0),
+                route_server_client: self.rs_client,
+                multihop_ttl: self.multihop_ttl.take(),
+                password: self.password.take(),
+                send_max: std::mem::take(&mut self.send_max),
+                prefix_limits: std::mem::take(&mut self.prefix_limits),
             },
+            admin_down: self.admin_down,
             local_sockaddr: self.local_sockaddr,
             remote_sockaddr: self.remote_sockaddr,
-            local_asn: self.local_asn,
-            passive: self.passive,
-            delete_on_disconnected: self.delete_on_disconnected,
-            admin_down: self.admin_down,
-            holdtime: self.holdtime,
-            connect_retry_time: self.connect_retry_time,
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(self.state as u8),
                 uptime: AtomicU64::new(0),
@@ -449,14 +459,8 @@ impl PeerBuilder {
                 remote_cap: ArcSwapOption::empty(),
             }),
             route_stats: FnvHashMap::default(),
-            local_cap: self.local_cap.split_off(0),
-            route_server_client: self.rs_client,
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            multihop_ttl: self.multihop_ttl.take(),
-            password: self.password.take(),
-            send_max: std::mem::take(&mut self.send_max),
-            prefix_limits: std::mem::take(&mut self.prefix_limits),
             peer_fsm: None,
             active_connect_cancel_tx: ActiveConnectCancel::default(),
             active_close_tx: CloseTx::default(),
@@ -477,9 +481,9 @@ impl From<&Peer> for api::Peer {
             .map(|caps| caps.iter().map(convert::capability_to_api).collect())
             .unwrap_or_default();
         let mut ps = api::PeerState {
-            neighbor_address: p.remote_addr.to_string(),
+            neighbor_address: p.config.remote_addr.to_string(),
             peer_asn: p.state.remote_asn.load(Ordering::Relaxed),
-            local_asn: p.local_asn,
+            local_asn: p.config.local_asn,
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
                 received: Some((&*p.counter_rx).into()),
@@ -487,7 +491,12 @@ impl From<&Peer> for api::Peer {
             }),
             queues: Some(Default::default()),
             remote_cap,
-            local_cap: p.local_cap.iter().map(convert::capability_to_api).collect(),
+            local_cap: p
+                .config
+                .local_cap
+                .iter()
+                .map(convert::capability_to_api)
+                .collect(),
             ..Default::default()
         };
         ps.session_state = session_state_to_api(session_state) as i32;
@@ -498,8 +507,8 @@ impl From<&Peer> for api::Peer {
         };
         let mut tm = api::Timers {
             config: Some(api::TimersConfig {
-                hold_time: p.holdtime,
-                keepalive_interval: p.holdtime / 3,
+                hold_time: p.config.holdtime,
+                keepalive_interval: p.config.holdtime / 3,
                 ..Default::default()
             }),
             state: Some(Default::default()),
@@ -507,7 +516,7 @@ impl From<&Peer> for api::Peer {
         let uptime = p.state.uptime.load(Ordering::Relaxed);
         if uptime != 0 {
             let negotiated_holdtime = std::cmp::min(
-                p.holdtime,
+                p.config.holdtime,
                 p.state.remote_holdtime.load(Ordering::Relaxed) as u64,
             );
             let mut ts = api::TimersState {
@@ -552,7 +561,7 @@ impl From<&Peer> for api::Peer {
             }),
             route_reflector: Some(Default::default()),
             route_server: Some(api::RouteServer {
-                route_server_client: p.route_server_client,
+                route_server_client: p.config.route_server_client,
                 secondary_route: false,
             }),
             afi_safis: afisafis,
@@ -914,9 +923,9 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
         let mut global = self.global.write().await;
-        if let Some(password) = peer.password.as_ref() {
+        if let Some(password) = peer.config.password.as_ref() {
             for fd in &global.listen_sockets {
-                auth::set_md5sig(*fd, &peer.remote_addr, password);
+                auth::set_md5sig(*fd, &peer.config.remote_addr, password);
             }
         }
         global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
@@ -940,7 +949,7 @@ impl GoBgpService for GrpcService {
                 {
                     let _ = tx.send(cease.clone());
                 }
-                if p.password.is_some() {
+                if p.config.password.is_some() {
                     for fd in &global.listen_sockets {
                         auth::set_md5sig(*fd, &peer_addr, "");
                     }
@@ -2024,13 +2033,13 @@ enum ToPeerEvent {
 }
 
 fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
-    if peer.admin_down || peer.passive || peer.delete_on_disconnected {
+    if peer.admin_down || peer.config.passive || peer.config.delete_on_disconnected {
         return;
     }
-    let peer_addr = peer.remote_addr;
-    let sockaddr = std::net::SocketAddr::new(peer_addr, peer.remote_port);
-    let retry_time = peer.connect_retry_time;
-    let password = peer.password.as_ref().map(|x| x.to_string());
+    let peer_addr = peer.config.remote_addr;
+    let sockaddr = std::net::SocketAddr::new(peer_addr, peer.config.remote_port);
+    let retry_time = peer.config.connect_retry_time;
+    let password = peer.config.password.as_ref().map(|x| x.to_string());
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     peer.active_connect_cancel_tx = ActiveConnectCancel(Some(cancel_tx));
     tokio::spawn(async move {
@@ -2215,7 +2224,7 @@ impl BmpClient {
         let mut established_peers = Vec::new();
         for peer in global.read().await.peers.values() {
             if peer.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                established_peers.push(peer.remote_addr);
+                established_peers.push(peer.config.remote_addr);
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
                 let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
                 let m = bmp::Message::PeerUp {
@@ -2223,7 +2232,7 @@ impl BmpClient {
                         remote_asn,
                         remote_id,
                         0,
-                        peer.remote_addr,
+                        peer.config.remote_addr,
                         peer.state.uptime.load(Ordering::Relaxed) as u32,
                     ),
                     local_addr: peer.local_sockaddr.ip(),
@@ -2243,10 +2252,11 @@ impl BmpClient {
                             .unwrap_or_default(),
                     }),
                     local_open: bgp::Message::Open(bgp::Open {
-                        as_number: peer.local_asn,
-                        holdtime: HoldTime::new(peer.holdtime as u16).unwrap_or(HoldTime::DISABLED),
+                        as_number: peer.config.local_asn,
+                        holdtime: HoldTime::new(peer.config.holdtime as u16)
+                            .unwrap_or(HoldTime::DISABLED),
                         router_id: u32::from(local_id),
-                        capability: peer.local_cap.to_owned(),
+                        capability: peer.config.local_cap.to_owned(),
                     }),
                 };
                 if lines.send(&m).await.is_err() {
@@ -2686,29 +2696,29 @@ impl Global {
         mut peer: Peer,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
-        if self.peers.contains_key(&peer.remote_addr) {
+        if self.peers.contains_key(&peer.config.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
             ));
         }
-        if peer.local_asn == 0 {
-            peer.local_asn = self.asn;
+        if peer.config.local_asn == 0 {
+            peer.config.local_asn = self.asn;
         }
         let mut caps = HashSet::new();
-        for c in &peer.local_cap {
+        for c in &peer.config.local_cap {
             caps.insert(Into::<u8>::into(c));
         }
-        let c = packet::Capability::FourOctetAsNumber(peer.local_asn);
+        let c = packet::Capability::FourOctetAsNumber(peer.config.local_asn);
         if !caps.contains(&Into::<u8>::into(&c)) {
-            peer.local_cap.push(c);
+            peer.config.local_cap.push(c);
         }
         peer.peer_fsm = Some(Arc::new(std::sync::Mutex::new(crate::fsm::PeerFsm::new(
             u32::from(self.router_id),
-            peer.local_asn,
-            peer.local_cap.clone(),
-            peer.holdtime,
+            peer.config.local_asn,
+            peer.config.local_cap.clone(),
+            peer.config.holdtime,
             peer.state.remote_asn.load(Ordering::Relaxed),
-            peer.send_max.clone(),
+            peer.config.send_max.clone(),
         ))));
         if peer.admin_down {
             peer.state
@@ -2718,7 +2728,7 @@ impl Global {
         if let Some(tx) = tx {
             enable_active_connect(&mut peer, tx);
         }
-        self.peers.insert(peer.remote_addr, peer);
+        self.peers.insert(peer.config.remote_addr, peer);
         Ok(())
     }
 }
@@ -2795,8 +2805,8 @@ async fn accept_connection(
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
-    if let Some(ttl) = peer.multihop_ttl {
-        if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn {
+    if let Some(ttl) = peer.config.multihop_ttl {
+        if peer.state.remote_asn.load(Ordering::Relaxed) != peer.config.local_asn {
             let _ = stream.set_ttl(ttl.into());
         }
     } else {
@@ -2811,16 +2821,16 @@ async fn accept_connection(
     Connection::new(
         stream,
         remote_addr,
-        peer.local_asn,
-        peer.local_cap.to_owned(),
-        peer.route_server_client,
+        peer.config.local_asn,
+        peer.config.local_cap.to_owned(),
+        peer.config.route_server_client,
         role,
         peer_fsm,
         Some(close_rx),
         peer.state.clone(),
         peer.counter_tx.clone(),
         peer.counter_rx.clone(),
-        peer.prefix_limits.clone(),
+        peer.config.prefix_limits.clone(),
         global.clone(),
         tables.clone(),
     )
@@ -3165,7 +3175,7 @@ impl Global {
             .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
 
         for (addr, peer) in &global.read().await.peers {
-            if let Some(password) = &peer.password {
+            if let Some(password) = &peer.config.password {
                 for l in &listen_sockets {
                     auth::set_md5sig(l.as_raw_fd(), addr, password);
                 }
@@ -3557,7 +3567,7 @@ fn peer_loop(
             }
             // Only reset and reconnect when no Connection remains for this peer.
             if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
-                if peer.delete_on_disconnected {
+                if peer.config.delete_on_disconnected {
                     server.peers.remove(&peer_addr);
                 } else {
                     peer.reset();
@@ -4490,6 +4500,6 @@ mod tests {
         let g = global.read().await;
         assert!(g.peers.contains_key(&remote_addr));
         let peer = g.peers.get(&remote_addr).unwrap();
-        assert!(peer.delete_on_disconnected);
+        assert!(peer.config.delete_on_disconnected);
     }
 }
