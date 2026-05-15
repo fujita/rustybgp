@@ -200,6 +200,9 @@ struct Peer {
     /// only known in `Global` but not at `Peer` construction time
     /// (`PeerBuilder::build`). It is always `Some` after `Global::add_peer`.
     peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
+    /// Set by StopActiveConnect (passive reached OpenConfirm); causes the
+    /// active connection retry loop to exit at its next iteration.
+    stop_active_connect: bool,
     /// One-shot channels used by the collision winner to deliver a CEASE
     /// Notification to the losing Handler. Each is consumed at most once.
     active_close_tx: CloseTx,
@@ -231,6 +234,7 @@ impl Peer {
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
+        self.stop_active_connect = false;
         self.active_close_tx = CloseTx::default();
         self.passive_close_tx = CloseTx::default();
     }
@@ -452,6 +456,7 @@ impl PeerBuilder {
             send_max: std::mem::take(&mut self.send_max),
             prefix_limits: std::mem::take(&mut self.prefix_limits),
             peer_fsm: None,
+            stop_active_connect: false,
             active_close_tx: CloseTx::default(),
             passive_close_tx: CloseTx::default(),
         }
@@ -1020,6 +1025,7 @@ impl GoBgpService for GrpcService {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
+                        p.stop_active_connect = false;
                         enable_active_connect(p, self.active_conn_tx.clone());
                         return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                     } else {
@@ -2027,7 +2033,10 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             {
                 let server = GLOBAL.write().await;
                 if let Some(peer) = server.peers.get(&peer_addr) {
-                    if peer.configured_time != configured_time || peer.active_close_tx.0.is_some() {
+                    if peer.configured_time != configured_time
+                        || peer.active_close_tx.0.is_some()
+                        || peer.stop_active_connect
+                    {
                         return;
                     }
                 } else {
@@ -3810,7 +3819,10 @@ impl Handler {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
-                    // TODO: cancel active connection retry timer.
+                    let mut global = GLOBAL.write().await;
+                    if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
+                        peer.stop_active_connect = true;
+                    }
                 }
             }
         }
