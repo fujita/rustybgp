@@ -154,18 +154,6 @@ struct CloseTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
 #[derive(Default)]
 struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 
-impl Clone for ActiveConnectCancel {
-    fn clone(&self) -> Self {
-        ActiveConnectCancel(None)
-    }
-}
-
-impl Clone for CloseTx {
-    fn clone(&self) -> Self {
-        CloseTx(None)
-    }
-}
-
 #[derive(Clone)]
 struct PeerConfig {
     remote_addr: IpAddr,
@@ -188,7 +176,6 @@ struct PeerConfig {
     prefix_limits: FnvHashMap<Family, u32>,
 }
 
-#[derive(Clone)]
 struct Peer {
     config: PeerConfig,
     admin_down: bool,
@@ -200,9 +187,6 @@ struct Peer {
 
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
-
-    // received and accepted
-    route_stats: FnvHashMap<Family, (u64, u64)>,
 
     /// Shared FSM for this peer; active and passive Connections for the same peer
     /// share one instance so collision detection sees both sessions.
@@ -220,12 +204,38 @@ struct Peer {
     passive_close_tx: CloseTx,
 }
 
-impl Peer {
+/// Read-only view of a peer for gRPC list responses.
+/// Holds clones of the config and cheap Arc references to live session state.
+struct PeerView {
+    config: PeerConfig,
+    admin_down: bool,
+    local_sockaddr: SocketAddr,
+    state: Arc<PeerState>,
+    counter_tx: Arc<MessageCounter>,
+    counter_rx: Arc<MessageCounter>,
+    route_stats: FnvHashMap<Family, (u64, u64)>,
+}
+
+impl PeerView {
     fn update_stats(&mut self, rti: FnvHashMap<Family, (u64, u64)>) {
         for (f, v) in rti {
             let stats = self.route_stats.entry(f).or_insert((0, 0));
             stats.0 += v.0;
             stats.1 += v.1;
+        }
+    }
+}
+
+impl Peer {
+    fn view(&self) -> PeerView {
+        PeerView {
+            config: self.config.clone(),
+            admin_down: self.admin_down,
+            local_sockaddr: self.local_sockaddr,
+            state: Arc::clone(&self.state),
+            counter_tx: Arc::clone(&self.counter_tx),
+            counter_rx: Arc::clone(&self.counter_rx),
+            route_stats: FnvHashMap::default(),
         }
     }
 
@@ -245,7 +255,6 @@ impl Peer {
         self.state
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
-        self.route_stats = FnvHashMap::default();
         self.active_connect_cancel_tx = ActiveConnectCancel::default();
         self.active_close_tx = CloseTx::default();
         self.passive_close_tx = CloseTx::default();
@@ -463,7 +472,6 @@ impl PeerBuilder {
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
             }),
-            route_stats: FnvHashMap::default(),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
             peer_fsm: None,
@@ -474,8 +482,8 @@ impl PeerBuilder {
     }
 }
 
-impl From<&Peer> for api::Peer {
-    fn from(p: &Peer) -> Self {
+impl From<&PeerView> for api::Peer {
+    fn from(p: &PeerView) -> Self {
         let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Relaxed))
             .unwrap_or(SessionState::Idle);
         let remote_cap = p
@@ -983,13 +991,13 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::ListPeerStream>, tonic::Status> {
         self.is_available(false).await?;
         let peer_addr = IpAddr::from_str(&request.into_inner().address);
-        let mut peers: FnvHashMap<IpAddr, Peer> = self
+        let mut peers: FnvHashMap<IpAddr, PeerView> = self
             .global
             .read()
             .await
             .peers
             .iter()
-            .map(|(a, p)| (*a, p.clone()))
+            .map(|(a, p)| (*a, p.view()))
             .collect();
 
         for i in 0..self.tables.shards.len() {
