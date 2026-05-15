@@ -183,6 +183,13 @@ struct Peer {
     send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
+    /// Shared FSM for this peer; active and passive Handlers for the same peer
+    /// share one instance so collision detection sees both sessions.
+    ///
+    /// `Option` because `PeerFsm::new` requires `local_router_id`, which is
+    /// only known in `Global` but not at `Peer` construction time
+    /// (`PeerBuilder::build`). It is always `Some` after `Global::add_peer`.
+    peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
 }
 
 impl Peer {
@@ -437,6 +444,7 @@ impl PeerBuilder {
             password: self.password.take(),
             send_max: std::mem::take(&mut self.send_max),
             prefix_limits: std::mem::take(&mut self.prefix_limits),
+            peer_fsm: None,
         }
     }
 }
@@ -2662,6 +2670,14 @@ impl Global {
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.local_cap.push(c);
         }
+        peer.peer_fsm = Some(Arc::new(std::sync::Mutex::new(crate::fsm::PeerFsm::new(
+            u32::from(self.router_id),
+            peer.local_asn,
+            peer.local_cap.clone(),
+            peer.holdtime,
+            peer.state.remote_asn.load(Ordering::Relaxed),
+            peer.send_max.clone(),
+        ))));
         if peer.admin_down {
             peer.state
                 .fsm
@@ -2682,7 +2698,6 @@ impl Global {
         let remote_sockaddr = stream.peer_addr().ok()?;
         let remote_addr = remote_sockaddr.ip();
         let mut global = GLOBAL.write().await;
-        let router_id = global.router_id;
         let (peer, mgmt_rx) = match global.peers.get_mut(&remote_addr) {
             Some(peer) => {
                 if peer.admin_down {
@@ -2753,19 +2768,18 @@ impl Global {
         } else {
             let _ = stream.set_ttl(1);
         }
+        let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
         Handler::new(
             stream,
             remote_addr,
             peer.local_asn,
-            router_id,
             peer.local_cap.to_owned(),
-            peer.holdtime,
             peer.route_server_client,
             role,
+            peer_fsm,
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
-            peer.send_max.clone(),
             peer.prefix_limits.clone(),
         )
         .map(|h| (h, mgmt_rx))
@@ -3465,7 +3479,7 @@ struct Handler {
 
     rs_client: bool,
 
-    peer_fsm: crate::fsm::PeerFsm,
+    peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
     role: crate::fsm::Role,
 
     stream: Option<TcpStream>,
@@ -3481,29 +3495,18 @@ impl Handler {
         stream: TcpStream,
         remote_addr: IpAddr,
         local_asn: u32,
-        local_router_id: Ipv4Addr,
         local_cap: Vec<packet::Capability>,
-        local_holdtime: u64,
         rs_client: bool,
         role: crate::fsm::Role,
+        peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
-        send_max: FnvHashMap<Family, usize>,
         prefix_limits: FnvHashMap<Family, u32>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
-        let expected_remote_asn = state.remote_asn.load(Ordering::Relaxed);
-        let peer_fsm = crate::fsm::PeerFsm::new(
-            u32::from(local_router_id),
-            local_asn,
-            local_cap.clone(),
-            local_holdtime,
-            expected_remote_asn,
-            send_max,
-        );
         Some(Handler {
             remote_addr,
             local_addr,
@@ -3563,6 +3566,8 @@ impl Handler {
             for f in codec.channel.keys() {
                 let effective_max = self
                     .peer_fsm
+                    .lock()
+                    .unwrap()
                     .session(self.role)
                     .and_then(|s| s.send_max().get(f))
                     .copied()
@@ -3840,6 +3845,8 @@ impl Handler {
         if any_update_pending {
             let outputs = self
                 .peer_fsm
+                .lock()
+                .unwrap()
                 .process(self.role, crate::fsm::Input::UpdateSent);
             for output in outputs {
                 if let crate::fsm::PeerFsmOutput::Session(
@@ -3919,6 +3926,8 @@ impl Handler {
 
         let outputs = self
             .peer_fsm
+            .lock()
+            .unwrap()
             .process(self.role, crate::fsm::Input::MessageReceived(msg));
         let has_session_down = outputs.iter().any(|o| {
             matches!(
@@ -3943,7 +3952,7 @@ impl Handler {
             if has_session_down {
                 return Err(Error::Packet(
                     rustybgp_packet::BgpError::FsmUnexpectedState {
-                        state: u8::from(self.peer_fsm.state(self.role)),
+                        state: u8::from(self.peer_fsm.lock().unwrap().state(self.role)),
                     }
                     .into(),
                 ));
@@ -4003,6 +4012,8 @@ impl Handler {
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
             .peer_fsm
+            .lock()
+            .unwrap()
             .process(self.role, crate::fsm::Input::Connected);
         self.apply_outputs(
             outputs,
@@ -4042,18 +4053,18 @@ impl Handler {
                 }
                 _ = holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
-                    let outputs = self.peer_fsm.process(self.role, crate::fsm::Input::HoldTimerExpired);
+                    let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 _ = keepalive_futures.next() => {
-                    let outputs = self.peer_fsm.process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
+                    let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                if self.peer_fsm.state(self.role) != SessionState::Established {
+                                if self.peer_fsm.lock().unwrap().state(self.role) != SessionState::Established {
                                     continue;
                                 }
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
@@ -4066,6 +4077,8 @@ impl Handler {
                                 // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
                                 let effective_max = self
                                     .peer_fsm
+                                    .lock()
+                                    .unwrap()
                                     .session(self.role)
                                     .and_then(|s| s.send_max().get(&ri.family))
                                     .copied()
@@ -4075,6 +4088,8 @@ impl Handler {
                                     // this peer's window (old_rank <= effective_max).
                                     if self
                                         .peer_fsm
+                                        .lock()
+                                        .unwrap()
                                         .session(self.role)
                                         .is_some_and(|s| s.send_max().contains_key(&ri.family))
                                         && ri.old_rank > 0
