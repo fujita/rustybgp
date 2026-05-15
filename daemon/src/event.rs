@@ -38,7 +38,7 @@ use std::sync::atomic::{
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Encoder, Framed};
@@ -755,12 +755,14 @@ struct GrpcService {
     policy_assignment_sem: tokio::sync::Semaphore,
     local_source: Arc<table::Source>,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+    global: GlobalHandle,
 }
 
 impl GrpcService {
     fn new(
         init: Arc<tokio::sync::Notify>,
         active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+        global: GlobalHandle,
     ) -> Self {
         GrpcService {
             init,
@@ -778,11 +780,12 @@ impl GrpcService {
                 false,
             )),
             active_conn_tx,
+            global,
         }
     }
 
     async fn is_available(&self, need_active: bool) -> Result<(), Error> {
-        let global = &GLOBAL.read().await;
+        let global = &self.global.read().await;
         if need_active && global.asn == 0 {
             return Err(Error::NotStarted);
         }
@@ -866,7 +869,7 @@ impl GoBgpService for GrpcService {
             ));
         }
 
-        let global = &mut GLOBAL.write().await;
+        let global = &mut self.global.write().await;
         if global.asn != 0 {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
@@ -894,7 +897,7 @@ impl GoBgpService for GrpcService {
         &self,
         _request: tonic::Request<api::GetBgpRequest>,
     ) -> Result<tonic::Response<api::GetBgpResponse>, tonic::Status> {
-        let global = (GLOBAL.read().await.deref()).into();
+        let global = (self.global.read().await.deref()).into();
 
         Ok(tonic::Response::new(api::GetBgpResponse {
             global: Some(global),
@@ -905,13 +908,13 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
-        let mut global = GLOBAL.write().await;
+        let mut global = self.global.write().await;
         if let Some(password) = peer.password.as_ref() {
             for fd in &global.listen_sockets {
                 auth::set_md5sig(*fd, &peer.remote_addr, password);
             }
         }
-        global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
+        global.add_peer(peer, Some(self.active_conn_tx.clone()), self.global.clone())?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -919,7 +922,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePeerRequest>,
     ) -> Result<tonic::Response<api::DeletePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            let mut global = GLOBAL.write().await;
+            let mut global = self.global.write().await;
             if let Some(mut p) = global.peers.remove(&peer_addr) {
                 let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                     code: 6,
@@ -961,7 +964,8 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::ListPeerStream>, tonic::Status> {
         self.is_available(false).await?;
         let peer_addr = IpAddr::from_str(&request.into_inner().address);
-        let mut peers: FnvHashMap<IpAddr, Peer> = GLOBAL
+        let mut peers: FnvHashMap<IpAddr, Peer> = self
+            .global
             .read()
             .await
             .peers
@@ -1021,12 +1025,12 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::EnablePeerRequest>,
     ) -> Result<tonic::Response<api::EnablePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut self.global.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
                         p.stop_active_connect = false;
-                        enable_active_connect(p, self.active_conn_tx.clone());
+                        enable_active_connect(p, self.active_conn_tx.clone(), self.global.clone());
                         return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                     } else {
                         return Err(tonic::Status::new(
@@ -1051,7 +1055,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DisablePeerRequest>,
     ) -> Result<tonic::Response<api::DisablePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut self.global.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         return Err(tonic::Status::new(
@@ -1209,7 +1213,8 @@ impl GoBgpService for GrpcService {
             .ok_or(Error::EmptyArgument)?;
         let conf = pg.conf.as_ref().ok_or(Error::EmptyArgument)?;
 
-        match GLOBAL
+        match self
+            .global
             .write()
             .await
             .peer_group
@@ -1265,7 +1270,7 @@ impl GoBgpService for GrpcService {
         let prefix = packet::IpNet::from_str(&dynamic.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
 
-        let global = &mut GLOBAL.write().await;
+        let global = &mut self.global.write().await;
         let pg = global
             .peer_group
             .get_mut(&dynamic.peer_group)
@@ -1467,7 +1472,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPolicyRequest>,
     ) -> Result<tonic::Response<api::AddPolicyResponse>, tonic::Status> {
         let policy = request.into_inner().policy.ok_or(Error::EmptyArgument)?;
-        GLOBAL
+        self.global
             .write()
             .await
             .ptable
@@ -1497,7 +1502,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListPolicyRequest>,
     ) -> Result<tonic::Response<Self::ListPolicyStream>, tonic::Status> {
         let request = request.into_inner();
-        let v: Vec<api::ListPolicyResponse> = GLOBAL
+        let v: Vec<api::ListPolicyResponse> = self
+            .global
             .read()
             .await
             .ptable
@@ -1534,7 +1540,7 @@ impl GoBgpService for GrpcService {
             .defined_set
             .ok_or(Error::EmptyArgument)?;
         let set = convert::defined_set_from_api(set).map_err(Error::from)?;
-        GLOBAL
+        self.global
             .write()
             .await
             .ptable
@@ -1561,7 +1567,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListDefinedSetRequest>,
     ) -> Result<tonic::Response<Self::ListDefinedSetStream>, tonic::Status> {
         let req = request.into_inner();
-        let v: Vec<api::ListDefinedSetResponse> = GLOBAL
+        let v: Vec<api::ListDefinedSetResponse> = self
+            .global
             .read()
             .await
             .ptable
@@ -1592,7 +1599,7 @@ impl GoBgpService for GrpcService {
         let conditions = convert::conditions_from_api(statement.conditions).map_err(Error::from)?;
         let (disposition, actions) =
             convert::disposition_from_api(statement.actions).map_err(Error::from)?;
-        GLOBAL
+        self.global
             .write()
             .await
             .ptable
@@ -1619,7 +1626,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListStatementRequest>,
     ) -> Result<tonic::Response<Self::ListStatementStream>, tonic::Status> {
         let request = request.into_inner();
-        let v: Vec<api::ListStatementResponse> = GLOBAL
+        let v: Vec<api::ListStatementResponse> = self
+            .global
             .read()
             .await
             .ptable
@@ -1649,7 +1657,7 @@ impl GoBgpService for GrpcService {
             .into_inner()
             .assignment
             .ok_or(Error::EmptyArgument)?;
-        add_policy_assignment(request).await?;
+        add_policy_assignment(request, self.global.clone()).await?;
         Ok(tonic::Response::new(api::AddPolicyAssignmentResponse {}))
     }
     async fn delete_policy_assignment(
@@ -1671,7 +1679,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<Self::ListPolicyAssignmentStream>, tonic::Status> {
         let request = request.into_inner();
-        let v: Vec<api::ListPolicyAssignmentResponse> = GLOBAL
+        let v: Vec<api::ListPolicyAssignmentResponse> = self
+            .global
             .read()
             .await
             .ptable
@@ -1708,7 +1717,7 @@ impl GoBgpService for GrpcService {
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
-        match GLOBAL.write().await.rpki_clients.entry(sockaddr) {
+        match self.global.write().await.rpki_clients.entry(sockaddr) {
             Occupied(_) => {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
@@ -1719,7 +1728,7 @@ impl GoBgpService for GrpcService {
                 let client = RpkiClient::new();
                 let t = client.configured_time;
                 v.insert(client);
-                RpkiClient::try_connect(sockaddr, t);
+                RpkiClient::try_connect(sockaddr, t, self.global.clone());
             }
         }
         Ok(tonic::Response::new(api::AddRpkiResponse {}))
@@ -1733,7 +1742,8 @@ impl GoBgpService for GrpcService {
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
         let sockaddr = SocketAddr::new(addr, request.port as u16);
 
-        let tx = if let Some(mut client) = GLOBAL.write().await.rpki_clients.remove(&sockaddr) {
+        let tx = if let Some(mut client) = self.global.write().await.rpki_clients.remove(&sockaddr)
+        {
             client.mgmt_tx.take()
         } else {
             None
@@ -1754,7 +1764,7 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::ListRpkiStream>, tonic::Status> {
         let mut v = FnvHashMap::default();
 
-        for (sockaddr, client) in &GLOBAL.read().await.rpki_clients {
+        for (sockaddr, client) in &self.global.read().await.rpki_clients {
             let r = api::Rpki {
                 conf: Some(api::RpkiConf {
                     address: sockaddr.ip().to_string(),
@@ -1863,7 +1873,7 @@ impl GoBgpService for GrpcService {
         let filename = request.filename;
         let mut d = MrtDumper::new(&filename, interval);
         {
-            let mut g = GLOBAL.write().await;
+            let mut g = self.global.write().await;
             if !g.mrt_filenames.insert(filename.clone()) {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
@@ -1874,15 +1884,16 @@ impl GoBgpService for GrpcService {
         let file = match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
             Ok(file) => file,
             Err(e) => {
-                GLOBAL.write().await.mrt_filenames.remove(&filename);
+                self.global.write().await.mrt_filenames.remove(&filename);
                 return Err(tonic::Status::new(
                     tonic::Code::Internal,
                     format!("failed to create mrt dump file: {e}"),
                 ));
             }
         };
+        let global = self.global.clone();
         tokio::spawn(async move {
-            if let Err(e) = d.serve(file).await {
+            if let Err(e) = d.serve(file, global).await {
                 println!("mrt dumper failed: {:?}", e);
             }
         });
@@ -1910,7 +1921,7 @@ impl GoBgpService for GrpcService {
         }
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
-        match GLOBAL.write().await.bmp_clients.entry(sockaddr) {
+        match self.global.write().await.bmp_clients.entry(sockaddr) {
             Occupied(_) => {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
@@ -1921,7 +1932,7 @@ impl GoBgpService for GrpcService {
                 let client = BmpClient::new();
                 let t = client.configured_time;
                 v.insert(client);
-                BmpClient::try_connect(sockaddr, t);
+                BmpClient::try_connect(sockaddr, t, self.global.clone());
             }
         }
         Ok(tonic::Response::new(api::AddBmpResponse {}))
@@ -1939,7 +1950,8 @@ impl GoBgpService for GrpcService {
         &self,
         _request: tonic::Request<api::ListBmpRequest>,
     ) -> Result<tonic::Response<Self::ListBmpStream>, tonic::Status> {
-        let v = GLOBAL
+        let v = self
+            .global
             .read()
             .await
             .bmp_clients
@@ -1981,9 +1993,12 @@ impl GoBgpService for GrpcService {
     }
 }
 
-async fn add_policy_assignment(req: api::PolicyAssignment) -> Result<(), Error> {
+async fn add_policy_assignment(
+    req: api::PolicyAssignment,
+    global: GlobalHandle,
+) -> Result<(), Error> {
     let (name, direction, default_action, policy_names) = convert::policy_assignment_from_api(req)?;
-    let (dir, assignment) = GLOBAL.write().await.ptable.add_assignment(
+    let (dir, assignment) = global.write().await.ptable.add_assignment(
         &name,
         direction,
         default_action,
@@ -2001,7 +2016,7 @@ enum ToPeerEvent {
     Advertise(table::Change),
 }
 
-fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
+fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>, global: GlobalHandle) {
     if peer.admin_down || peer.passive || peer.delete_on_disconnected {
         return;
     }
@@ -2031,7 +2046,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)).await;
             {
-                let server = GLOBAL.write().await;
+                let server = global.write().await;
                 if let Some(peer) = server.peers.get(&peer_addr) {
                     if peer.configured_time != configured_time
                         || peer.active_close_tx.0.is_some()
@@ -2068,7 +2083,11 @@ impl MrtDumper {
         }
     }
 
-    async fn serve(&mut self, mut file: tokio::fs::File) -> Result<(), Error> {
+    async fn serve(
+        &mut self,
+        mut file: tokio::fs::File,
+        global: GlobalHandle,
+    ) -> Result<(), Error> {
         let (tx, rx) = mpsc::unbounded_channel();
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
@@ -2081,7 +2100,7 @@ impl MrtDumper {
             let mut t = TABLE[i].lock().await;
             t.mrt_event_tx.remove(&self.filename);
         }
-        GLOBAL.write().await.mrt_filenames.remove(&self.filename);
+        global.write().await.mrt_filenames.remove(&self.filename);
         result
     }
 
@@ -2140,7 +2159,7 @@ impl BmpClient {
         }
     }
 
-    async fn serve(stream: TcpStream, sockaddr: SocketAddr) {
+    async fn serve(stream: TcpStream, sockaddr: SocketAddr, global: GlobalHandle) {
         let mut lines = Framed::new(stream, bmp::BmpCodec::new());
         let sysname = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("unknown"));
         let _ = lines
@@ -2186,9 +2205,9 @@ impl BmpClient {
                 }
             }
         }
-        let local_id = GLOBAL.read().await.router_id;
+        let local_id = global.read().await.router_id;
         let mut established_peers = Vec::new();
-        for peer in GLOBAL.read().await.peers.values() {
+        for peer in global.read().await.peers.values() {
             if peer.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
                 established_peers.push(peer.remote_addr);
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
@@ -2302,7 +2321,7 @@ impl BmpClient {
         }
     }
 
-    fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
+    fn try_connect(sockaddr: SocketAddr, configured_time: u64, global: GlobalHandle) {
         tokio::spawn(async move {
             loop {
                 if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2311,7 +2330,7 @@ impl BmpClient {
                 )
                 .await
                 {
-                    if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
                         client.uptime = SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -2319,8 +2338,8 @@ impl BmpClient {
                     } else {
                         break;
                     }
-                    BmpClient::serve(stream, sockaddr).await;
-                    if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                    BmpClient::serve(stream, sockaddr, global.clone()).await;
+                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
                         client.downtime = SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -2330,7 +2349,7 @@ impl BmpClient {
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
                     }
@@ -2531,7 +2550,7 @@ impl RpkiClient {
         Ok(())
     }
 
-    fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
+    fn try_connect(sockaddr: SocketAddr, configured_time: u64, global: GlobalHandle) {
         tokio::spawn(async move {
             loop {
                 if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2542,7 +2561,7 @@ impl RpkiClient {
                 {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let state = if let Some(client) =
-                        GLOBAL.write().await.rpki_clients.get_mut(&sockaddr)
+                        global.write().await.rpki_clients.get_mut(&sockaddr)
                     {
                         client.mgmt_tx = Some(tx);
                         client.state.clone()
@@ -2553,7 +2572,7 @@ impl RpkiClient {
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
-                if let Some(client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                if let Some(client) = global.write().await.rpki_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
                     }
@@ -2593,7 +2612,6 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
 }
 
 static NUM_TABLES: LazyLock<usize> = LazyLock::new(num_cpus::get);
-static GLOBAL: LazyLock<RwLock<Global>> = LazyLock::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static KERNEL_TX: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>> =
@@ -2611,6 +2629,8 @@ static TABLE: LazyLock<Vec<Mutex<Table>>> = LazyLock::new(|| {
     }
     table
 });
+
+type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
 
 struct Global {
     asn: u32,
@@ -2670,6 +2690,7 @@ impl Global {
         &mut self,
         mut peer: Peer,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
+        global: GlobalHandle,
     ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&peer.remote_addr) {
             return Err(Error::AlreadyExists(
@@ -2701,18 +2722,22 @@ impl Global {
                 .store(SessionState::Connect as u8, Ordering::Relaxed);
         }
         if let Some(tx) = tx {
-            enable_active_connect(&peer, tx);
+            enable_active_connect(&peer, tx, global);
         }
         self.peers.insert(peer.remote_addr, peer);
         Ok(())
     }
 
-    async fn accept_connection(stream: TcpStream, role: crate::fsm::Role) -> Option<Handler> {
+    async fn accept_connection(
+        &mut self,
+        stream: TcpStream,
+        role: crate::fsm::Role,
+        global: GlobalHandle,
+    ) -> Option<Handler> {
         let local_sockaddr = stream.local_addr().ok()?;
         let remote_sockaddr = stream.peer_addr().ok()?;
         let remote_addr = remote_sockaddr.ip();
-        let mut global = GLOBAL.write().await;
-        let peer = match global.peers.get_mut(&remote_addr) {
+        let peer = match self.peers.get_mut(&remote_addr) {
             Some(peer) => {
                 if peer.admin_down {
                     println!(
@@ -2741,7 +2766,7 @@ impl Global {
                 let mut rs_client = false;
                 let mut remote_asn = 0;
                 let mut holdtime = None;
-                for p in &global.peer_group {
+                for p in &self.peer_group {
                     for d in &p.1.dynamic_peers {
                         if d.prefix.contains(&remote_addr) {
                             remote_asn = p.1.as_number;
@@ -2770,8 +2795,8 @@ impl Global {
                 if let Some(holdtime) = holdtime {
                     builder.holdtime(holdtime);
                 }
-                let _ = global.add_peer(builder.build(), None);
-                global.peers.get_mut(&remote_addr).unwrap()
+                let _ = self.add_peer(builder.build(), None, global.clone());
+                self.peers.get_mut(&remote_addr).unwrap()
             }
         };
         if let Some(ttl) = peer.multihop_ttl {
@@ -2800,6 +2825,7 @@ impl Global {
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
             peer.prefix_limits.clone(),
+            global,
         )
     }
 
@@ -2809,6 +2835,7 @@ impl Global {
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
+        let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new()));
         let global_config = bgp
             .as_ref()
             .and_then(|x| x.global.as_ref())
@@ -2826,9 +2853,9 @@ impl Global {
         let notify = Arc::new(tokio::sync::Notify::new());
         if as_number != 0 {
             notify.clone().notify_one();
-            let global = &mut GLOBAL.write().await;
-            global.asn = as_number;
-            global.router_id = router_id;
+            let g = &mut global.write().await;
+            g.asn = as_number;
+            g.router_id = router_id;
         }
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
             for m in mrt {
@@ -2841,7 +2868,7 @@ impl Global {
                     }
                     if let Some(filename) = config.file_name.as_ref() {
                         {
-                            let mut g = GLOBAL.write().await;
+                            let mut g = global.write().await;
                             if !g.mrt_filenames.insert(filename.clone()) {
                                 println!("mrt dumper already enabled for {filename}, skipping");
                                 continue;
@@ -2852,14 +2879,15 @@ impl Global {
                         let mut d = MrtDumper::new(&filename, interval);
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
+                                let global2 = global.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = d.serve(file).await {
+                                    if let Err(e) = d.serve(file, global2).await {
                                         println!("mrt dumper failed: {:?}", e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                GLOBAL.write().await.mrt_filenames.remove(&filename);
+                                global.write().await.mrt_filenames.remove(&filename);
                                 println!("failed to create mrt dump file: {:?}", e);
                             }
                         }
@@ -2910,7 +2938,7 @@ impl Global {
             }
         }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             for pg in groups {
                 if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
                     server.peer_group.insert(
@@ -2939,7 +2967,7 @@ impl Global {
             }
         }
         if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             for n in neighbors {
                 if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref())
                     && let Ok(prefix) = packet::IpNet::from_str(prefix)
@@ -2953,7 +2981,7 @@ impl Global {
             }
         }
         if let Some(bmp_servers) = bgp.as_ref().and_then(|x| x.bmp_servers.as_ref()) {
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             for s in bmp_servers {
                 let config = s.config.as_ref().unwrap();
                 let sockaddr =
@@ -2966,7 +2994,7 @@ impl Global {
                         let client = BmpClient::new();
                         let t = client.configured_time;
                         v.insert(client);
-                        BmpClient::try_connect(sockaddr, t);
+                        BmpClient::try_connect(sockaddr, t, global.clone());
                     }
                 }
             }
@@ -2974,7 +3002,7 @@ impl Global {
         if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
             match convert::defined_sets_to_api(defined_sets) {
                 Ok(sets) => {
-                    let mut server = GLOBAL.write().await;
+                    let mut server = global.write().await;
                     for set in sets {
                         let set = convert::defined_set_from_api(set).unwrap();
                         if let Err(e) = server.ptable.add_defined_set(set) {
@@ -2987,7 +3015,7 @@ impl Global {
         }
         if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
             let mut h = HashSet::new();
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             for policy in policies {
                 if let Some(name) = &policy.name {
                     let mut s_names = Vec::new();
@@ -3042,20 +3070,26 @@ impl Global {
                 }
             };
             if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
-                if let Err(e) = add_policy_assignment(f(
-                    1,
-                    config.import_policy_list.as_ref(),
-                    config.default_import_policy.as_ref(),
-                ))
+                if let Err(e) = add_policy_assignment(
+                    f(
+                        1,
+                        config.import_policy_list.as_ref(),
+                        config.default_import_policy.as_ref(),
+                    ),
+                    global.clone(),
+                )
                 .await
                 {
                     panic!("{:?}", e);
                 }
-                if let Err(e) = add_policy_assignment(f(
-                    2,
-                    config.export_policy_list.as_ref(),
-                    config.default_export_policy.as_ref(),
-                ))
+                if let Err(e) = add_policy_assignment(
+                    f(
+                        2,
+                        config.export_policy_list.as_ref(),
+                        config.default_export_policy.as_ref(),
+                    ),
+                    global.clone(),
+                )
                 .await
                 {
                     panic!("{:?}", e);
@@ -3063,11 +3097,13 @@ impl Global {
             }
         }
         if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             for p in peers {
                 match Peer::try_from(p) {
                     Ok(peer) => {
-                        if let Err(e) = server.add_peer(peer, Some(active_tx.clone())) {
+                        if let Err(e) =
+                            server.add_peer(peer, Some(active_tx.clone()), global.clone())
+                        {
                             eprintln!("failed to add peer from config: {}", e);
                         }
                     }
@@ -3078,7 +3114,7 @@ impl Global {
             }
         }
         if any_peer {
-            let mut server = GLOBAL.write().await;
+            let mut server = global.write().await;
             server.peer_group.insert(
                 "any".to_string(),
                 PeerGroup {
@@ -3100,10 +3136,11 @@ impl Global {
         let addr = "0.0.0.0:50051".parse().unwrap();
         let notify2 = notify.clone();
         let active_tx2 = active_tx.clone();
+        let global2 = global.clone();
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(GoBgpServiceServer::new(GrpcService::new(
-                    notify2, active_tx2,
+                    notify2, active_tx2, global2,
                 )))
                 .serve(addr)
                 .await
@@ -3112,7 +3149,7 @@ impl Global {
             }
         });
         notify.notified().await;
-        let listen_port = GLOBAL.read().await.listen_port;
+        let listen_port = global.read().await.listen_port;
         let listen_sockets: Vec<std::net::TcpListener> = vec![
             create_listen_socket("0.0.0.0".to_string(), listen_port),
             create_listen_socket("[::]".to_string(), listen_port),
@@ -3120,13 +3157,13 @@ impl Global {
         .into_iter()
         .filter_map(|x| x.ok())
         .collect();
-        GLOBAL
+        global
             .write()
             .await
             .listen_sockets
             .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
 
-        for (addr, peer) in &GLOBAL.read().await.peers {
+        for (addr, peer) in &global.read().await.peers {
             if let Some(password) = &peer.password {
                 for l in &listen_sockets {
                     auth::set_md5sig(l.as_raw_fd(), addr, password);
@@ -3148,16 +3185,22 @@ impl Global {
             }
             futures::select_biased! {
                 stream = bgp_listen_futures.next() => {
-                    if let Some(Some(Ok(stream))) = stream
-                        && let Some(h) = Global::accept_connection(stream, crate::fsm::Role::Passive).await {
-                            peer_loop(h, active_tx.clone());
+                    if let Some(Some(Ok(stream))) = stream {
+                        let mut g = global.write().await;
+                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Passive, global.clone()).await {
+                            drop(g);
+                            peer_loop(h, global.clone(), active_tx.clone());
                         }
+                    }
                 }
                 stream = active_rx.recv().fuse() => {
-                    if let Some(stream) = stream
-                        && let Some(h) = Global::accept_connection(stream, crate::fsm::Role::Active).await {
-                            peer_loop(h, active_tx.clone());
+                    if let Some(stream) = stream {
+                        let mut g = global.write().await;
+                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Active, global.clone()).await {
+                            drop(g);
+                            peer_loop(h, global.clone(), active_tx.clone());
                         }
+                    }
                 }
             }
         }
@@ -3460,12 +3503,16 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
     })
 }
 
-fn peer_loop(mut h: Handler, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
+fn peer_loop(
+    mut h: Handler,
+    global: GlobalHandle,
+    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+) {
     tokio::spawn(async move {
         let peer_addr = h.remote_addr;
         let role = h.role;
         let _ = h.run().await;
-        let mut server = GLOBAL.write().await;
+        let mut server = global.write().await;
         if let Some(peer) = server.peers.get_mut(&peer_addr) {
             match role {
                 crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
@@ -3477,7 +3524,7 @@ fn peer_loop(mut h: Handler, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
                     server.peers.remove(&peer_addr);
                 } else {
                     peer.reset();
-                    enable_active_connect(peer, active_conn_tx);
+                    enable_active_connect(peer, active_conn_tx, global.clone());
                 }
             }
         }
@@ -3513,6 +3560,7 @@ struct Handler {
     shutdown: Option<bmp::PeerDownReason>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
+    global: GlobalHandle,
 }
 
 impl Handler {
@@ -3529,6 +3577,7 @@ impl Handler {
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
         prefix_limits: FnvHashMap<Family, u32>,
+        global: GlobalHandle,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -3551,6 +3600,7 @@ impl Handler {
             peer_event_tx: Vec::new(),
             shutdown: None,
             prefix_limits,
+            global,
         })
     }
 
@@ -3698,7 +3748,7 @@ impl Handler {
                         urgent.push(m);
                     } else {
                         let tx = {
-                            let mut global = GLOBAL.write().await;
+                            let mut global = self.global.write().await;
                             if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
                                 match role {
                                     crate::fsm::Role::Active => peer.active_close_tx.0.take(),
@@ -3819,7 +3869,7 @@ impl Handler {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
-                    let mut global = GLOBAL.write().await;
+                    let mut global = self.global.write().await;
                     if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
                         peer.stop_active_connect = true;
                     }
