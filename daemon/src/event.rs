@@ -145,6 +145,17 @@ struct PeerState {
     remote_cap: ArcSwapOption<Vec<packet::Capability>>,
 }
 
+/// Wraps a oneshot Sender so that `Peer` can derive `Clone`.
+/// Cloning produces `None` — the clone is for read-only listing, not signalling.
+#[derive(Default)]
+struct CollisionTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
+
+impl Clone for CollisionTx {
+    fn clone(&self) -> Self {
+        CollisionTx(None)
+    }
+}
+
 #[derive(Clone)]
 struct Peer {
     /// if a peer was removed and created again quickly,
@@ -190,6 +201,10 @@ struct Peer {
     /// only known in `Global` but not at `Peer` construction time
     /// (`PeerBuilder::build`). It is always `Some` after `Global::add_peer`.
     peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
+    /// One-shot channels used by the collision winner to deliver a CEASE
+    /// Notification to the losing Handler. Each is consumed at most once.
+    active_collision_tx: CollisionTx,
+    passive_collision_tx: CollisionTx,
 }
 
 impl Peer {
@@ -218,6 +233,8 @@ impl Peer {
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
         self.mgmt_tx = None;
+        self.active_collision_tx = CollisionTx::default();
+        self.passive_collision_tx = CollisionTx::default();
     }
 }
 
@@ -445,6 +462,8 @@ impl PeerBuilder {
             send_max: std::mem::take(&mut self.send_max),
             prefix_limits: std::mem::take(&mut self.prefix_limits),
             peer_fsm: None,
+            active_collision_tx: CollisionTx::default(),
+            passive_collision_tx: CollisionTx::default(),
         }
     }
 }
@@ -2769,6 +2788,13 @@ impl Global {
             let _ = stream.set_ttl(1);
         }
         let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
+        let (collision_tx, collision_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+        match role {
+            crate::fsm::Role::Active => peer.active_collision_tx = CollisionTx(Some(collision_tx)),
+            crate::fsm::Role::Passive => {
+                peer.passive_collision_tx = CollisionTx(Some(collision_tx))
+            }
+        }
         Handler::new(
             stream,
             remote_addr,
@@ -2777,6 +2803,7 @@ impl Global {
             peer.route_server_client,
             role,
             peer_fsm,
+            Some(collision_rx),
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
@@ -3481,6 +3508,9 @@ struct Handler {
 
     peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
     role: crate::fsm::Role,
+    /// Receives a CEASE Notification from the collision winner; when fired
+    /// this Handler is the loser and must send the message then close.
+    collision_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
 
     stream: Option<TcpStream>,
     source: Option<Arc<table::Source>>,
@@ -3499,6 +3529,7 @@ impl Handler {
         rs_client: bool,
         role: crate::fsm::Role,
         peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
+        collision_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
@@ -3519,6 +3550,7 @@ impl Handler {
             rs_client,
             peer_fsm,
             role,
+            collision_rx,
             stream: Some(stream),
             source: None,
             peer_event_tx: Vec::new(),
@@ -3666,8 +3698,25 @@ impl Handler {
     ) {
         for output in outputs {
             match output {
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SendMessage(m)) => {
-                    urgent.push(m);
+                crate::fsm::PeerFsmOutput::Session(role, crate::fsm::Output::SendMessage(m)) => {
+                    if role == self.role {
+                        urgent.push(m);
+                    } else {
+                        let tx = {
+                            let mut global = GLOBAL.write().await;
+                            if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
+                                match role {
+                                    crate::fsm::Role::Active => peer.active_collision_tx.0.take(),
+                                    crate::fsm::Role::Passive => peer.passive_collision_tx.0.take(),
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(tx) = tx {
+                            let _ = tx.send(m);
+                        }
+                    }
                 }
                 crate::fsm::PeerFsmOutput::Session(
                     _,
@@ -4027,6 +4076,8 @@ impl Handler {
         )
         .await;
 
+        let mut collision_rx: futures::future::OptionFuture<_> =
+            self.collision_rx.take().map(|rx| rx.fuse()).into();
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
@@ -4049,6 +4100,12 @@ impl Handler {
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
                         urgent.insert(0, msg);
+                    }
+                }
+                cease = &mut collision_rx => {
+                    if let Some(Ok(msg)) = cease {
+                        urgent.insert(0, msg);
+                        self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                     }
                 }
                 _ = holdtime_futures.next() => {
