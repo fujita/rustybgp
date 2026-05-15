@@ -4342,3 +4342,154 @@ impl Handler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn make_global() -> GlobalHandle {
+        let mut g = Global::new();
+        g.asn = 65001;
+        g.router_id = Ipv4Addr::new(1, 0, 0, 1);
+        Arc::new(tokio::sync::RwLock::new(g))
+    }
+
+    fn make_tables() -> TableHandle {
+        Arc::new(Tables::new(1))
+    }
+
+    /// Returns (client_stream, server_stream) connected over loopback.
+    /// Pass `server_stream` to `accept_connection`; `remote_addr` is
+    /// `client_stream.local_addr().ip()`.
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept(),);
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn accept_known_peer_passive() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+                .unwrap();
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert_eq!(
+            peer.state.fsm.load(Ordering::Relaxed),
+            SessionState::Active as u8
+        );
+        assert!(peer.passive_close_tx.0.is_some());
+    }
+
+    #[tokio::test]
+    async fn accept_known_peer_active() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+                .unwrap();
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Active).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert!(peer.active_close_tx.0.is_some());
+    }
+
+    #[tokio::test]
+    async fn accept_admin_down_peer_rejected() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.add_peer(PeerBuilder::new(remote_addr).admin_down(true).build(), None)
+                .unwrap();
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_already_connected_peer_rejected() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+                .unwrap();
+            let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+            g.peers.get_mut(&remote_addr).unwrap().passive_close_tx = CloseTx(Some(tx));
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_unknown_peer_no_dynamic_config_rejected() {
+        let global = make_global();
+        let tables = make_tables();
+        let (_client, server) = loopback_pair().await;
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_dynamic_peer_added() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.peer_group.insert(
+                "test-group".to_string(),
+                PeerGroup {
+                    as_number: 65002,
+                    dynamic_peers: vec![DynamicPeer {
+                        prefix: packet::IpNet::new(remote_addr, 32),
+                    }],
+                    route_server_client: false,
+                    holdtime: None,
+                },
+            );
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        assert!(g.peers.contains_key(&remote_addr));
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert!(peer.delete_on_disconnected);
+    }
+}
