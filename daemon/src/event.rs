@@ -199,7 +199,7 @@ struct Peer {
     send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
-    /// Shared FSM for this peer; active and passive Handlers for the same peer
+    /// Shared FSM for this peer; active and passive Connections for the same peer
     /// share one instance so collision detection sees both sessions.
     ///
     /// `Option` because `PeerFsm::new` requires `local_router_id`, which is
@@ -210,7 +210,7 @@ struct Peer {
     /// Dropping the inner sender signals the task to exit.
     active_connect_cancel_tx: ActiveConnectCancel,
     /// One-shot channels used by the collision winner to deliver a CEASE
-    /// Notification to the losing Handler. Each is consumed at most once.
+    /// Notification to the losing Connection. Each is consumed at most once.
     active_close_tx: CloseTx,
     passive_close_tx: CloseTx,
 }
@@ -2728,7 +2728,7 @@ async fn accept_connection(
     tables: &TableHandle,
     stream: TcpStream,
     role: crate::fsm::Role,
-) -> Option<Handler> {
+) -> Option<Connection> {
     let local_sockaddr = stream.local_addr().ok()?;
     let remote_sockaddr = stream.peer_addr().ok()?;
     let remote_addr = remote_sockaddr.ip();
@@ -2808,7 +2808,7 @@ async fn accept_connection(
         crate::fsm::Role::Active => peer.active_close_tx = CloseTx(Some(close_tx)),
         crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx(Some(close_tx)),
     }
-    Handler::new(
+    Connection::new(
         stream,
         remote_addr,
         peer.local_asn,
@@ -3541,7 +3541,7 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
 }
 
 fn peer_loop(
-    mut h: Handler,
+    mut h: Connection,
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
@@ -3555,7 +3555,7 @@ fn peer_loop(
                 crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
                 crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
             }
-            // Only reset and reconnect when no Handler remains for this peer.
+            // Only reset and reconnect when no Connection remains for this peer.
             if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
                 if peer.delete_on_disconnected {
                     server.peers.remove(&peer_addr);
@@ -3568,7 +3568,7 @@ fn peer_loop(
     });
 }
 
-struct Handler {
+struct Connection {
     remote_addr: IpAddr,
     local_addr: IpAddr,
     /// IPv6 link-local address of the local interface (for 32-byte MP_REACH nexthop).
@@ -3588,7 +3588,7 @@ struct Handler {
     peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
     role: crate::fsm::Role,
     /// Receives a CEASE Notification from an external signal (collision winner
-    /// or admin operation); on receipt this Handler sends the message and closes.
+    /// or admin operation); on receipt this Connection sends the message and closes.
     close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
 
     stream: Option<TcpStream>,
@@ -3601,7 +3601,7 @@ struct Handler {
     tables: TableHandle,
 }
 
-impl Handler {
+impl Connection {
     fn new(
         stream: TcpStream,
         remote_addr: IpAddr,
@@ -3621,7 +3621,7 @@ impl Handler {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
-        Some(Handler {
+        Some(Connection {
             remote_addr,
             local_addr,
             link_addr,
