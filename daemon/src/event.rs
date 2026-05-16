@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::too_many_arguments)]
-
 use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
@@ -3605,6 +3603,15 @@ enum GlobalEffect {
     StopActiveConnect,
 }
 
+struct RunState {
+    urgent: Vec<bgp::Message>,
+    framer: BgpFramer,
+    keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
+    holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
+    pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
+    txbuf_size: usize,
+}
+
 struct Connection {
     remote_addr: IpAddr,
     local_addr: IpAddr,
@@ -3639,6 +3646,7 @@ struct Connection {
 }
 
 impl Connection {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: TcpStream,
         remote_addr: IpAddr,
@@ -3810,11 +3818,7 @@ impl Connection {
     async fn apply_outputs(
         &mut self,
         outputs: Vec<crate::fsm::PeerFsmOutput>,
-        urgent: &mut Vec<bgp::Message>,
-        framer: &mut BgpFramer,
-        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
+        rs: &mut RunState,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
     ) -> Vec<GlobalEffect> {
@@ -3823,7 +3827,7 @@ impl Connection {
             match output {
                 crate::fsm::PeerFsmOutput::Session(role, crate::fsm::Output::SendMessage(m)) => {
                     if role == self.role {
-                        urgent.push(m);
+                        rs.urgent.push(m);
                     } else {
                         effects.push(GlobalEffect::SendCease { role, msg: m });
                     }
@@ -3832,12 +3836,12 @@ impl Connection {
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) => {
-                    *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    rs.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
                 crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SetHoldTimer(secs)) => {
-                    *holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    rs.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
@@ -3882,7 +3886,7 @@ impl Connection {
                             }
                         }
                     }
-                    framer.inner_mut().channel = channels;
+                    rs.framer.inner_mut().channel = channels;
                 }
                 crate::fsm::PeerFsmOutput::Session(
                     _,
@@ -3901,8 +3905,13 @@ impl Connection {
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
-                    self.on_established(framer.inner(), local_sockaddr, remote_sockaddr, pending)
-                        .await;
+                    self.on_established(
+                        rs.framer.inner(),
+                        local_sockaddr,
+                        remote_sockaddr,
+                        &mut rs.pending,
+                    )
+                    .await;
                 }
                 crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(reason)) => {
                     self.shutdown = Some(match reason {
@@ -3966,25 +3975,17 @@ impl Connection {
         }
     }
 
-    async fn flush_tx(
-        &mut self,
-        stream: &mut TcpStream,
-        framer: &mut BgpFramer,
-        txbuf_size: usize,
-        urgent: &mut Vec<bgp::Message>,
-        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
-    ) {
+    async fn flush_tx(&mut self, stream: &mut TcpStream, rs: &mut RunState) {
         // 1. Flush urgent (open, keepalive, notification) messages.
-        let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-        for _ in 0..urgent.len() {
-            let msg = urgent.remove(0);
-            let _ = framer.encode_to(&msg, &mut txbuf);
+        let mut txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
+        for _ in 0..rs.urgent.len() {
+            let msg = rs.urgent.remove(0);
+            let _ = rs.framer.encode_to(&msg, &mut txbuf);
             (*self.counter_tx).sync(&msg);
 
-            if txbuf.len() > txbuf_size {
+            if txbuf.len() > rs.txbuf_size {
                 let buf = txbuf.freeze();
-                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
                 if stream.write_all(&buf).await.is_err() {
                     self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                     return;
@@ -3997,26 +3998,27 @@ impl Connection {
         }
 
         // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
-        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-        let any_update_pending = pending.values().any(|p| !p.is_empty());
-        for (family, p) in pending.iter_mut() {
+        txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
+        let any_update_pending = rs.pending.values().any(|p| !p.is_empty());
+        for (family, p) in rs.pending.iter_mut() {
             // IPv4-unicast can carry reachability either in the UPDATE's
             // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
             // Extended Nexthop is negotiated). Every other family must use
             // MP_REACH_NLRI.
             let use_mp = *family != packet::Family::IPV4
-                || framer
+                || rs
+                    .framer
                     .inner()
                     .channel
                     .get(family)
                     .is_some_and(|c| c.extended_nexthop());
             for msg in p.drain_messages(*family, use_mp) {
-                let _ = framer.encode_to(&msg, &mut txbuf);
+                let _ = rs.framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
 
-                if txbuf.len() > txbuf_size {
+                if txbuf.len() > rs.txbuf_size {
                     let buf = txbuf.freeze();
-                    txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                    txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
                     if stream.write_all(&buf).await.is_err() {
                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         return;
@@ -4039,7 +4041,7 @@ impl Connection {
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) = output
                 {
-                    *keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    rs.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
@@ -4094,14 +4096,10 @@ impl Connection {
 
     async fn rx_msg(
         &mut self,
-        framer: &mut BgpFramer,
+        rs: &mut RunState,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
-        urgent: &mut Vec<bgp::Message>,
-        keepalive_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) -> std::result::Result<(), Error> {
         // Extract UPDATE fields before passing to FSM (FSM doesn't process routes).
         let update_fields = if let bgp::Message::Update(ref u) = msg {
@@ -4129,16 +4127,7 @@ impl Connection {
             )
         });
         let effects = self
-            .apply_outputs(
-                outputs,
-                urgent,
-                framer,
-                keepalive_futures,
-                holdtime_futures,
-                pending,
-                local_sockaddr,
-                remote_sockaddr,
-            )
+            .apply_outputs(outputs, rs, local_sockaddr, remote_sockaddr)
             .await;
         self.process_effects(effects).await;
 
@@ -4180,7 +4169,7 @@ impl Connection {
         if self.rs_client {
             builder.keep_aspath(true).keep_nexthop(true);
         }
-        let mut framer = BgpFramer::new(builder.build());
+        let framer = BgpFramer::new(builder.build());
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..self.tables.shards.len() {
@@ -4189,17 +4178,18 @@ impl Connection {
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
         }
 
-        let mut pending_update: FnvHashMap<Family, crate::peer_tx::PendingTx> =
-            FnvHashMap::default();
-        let mut urgent = Vec::new();
-        let mut holdtime_futures: FuturesUnordered<_> =
-            vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+        let mut rs = RunState {
+            urgent: Vec::new(),
+            framer,
+            holdtime_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
-                .collect();
-        let mut keepalive_futures: FuturesUnordered<_> =
-            vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .collect(),
+            keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
-                .collect();
+                .collect(),
+            pending: FnvHashMap::default(),
+            txbuf_size,
+        };
 
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
@@ -4208,16 +4198,7 @@ impl Connection {
             .unwrap()
             .process(self.role, crate::fsm::Input::Connected);
         let effects = self
-            .apply_outputs(
-                outputs,
-                &mut urgent,
-                &mut framer,
-                &mut keepalive_futures,
-                &mut holdtime_futures,
-                &mut pending_update,
-                local_sockaddr,
-                remote_sockaddr,
-            )
+            .apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr)
             .await;
         self.process_effects(effects).await;
 
@@ -4228,9 +4209,9 @@ impl Connection {
             let mut peer_event_futures: FuturesUnordered<_> =
                 peer_event_rx.iter_mut().map(|rx| rx.next()).collect();
 
-            let interest = if urgent.is_empty() {
+            let interest = if rs.urgent.is_empty() {
                 let mut interest = tokio::io::Interest::READABLE;
-                for p in pending_update.values_mut() {
+                for p in rs.pending.values_mut() {
                     if !p.is_empty() {
                         interest |= tokio::io::Interest::WRITABLE;
                         break;
@@ -4244,19 +4225,19 @@ impl Connection {
             futures::select_biased! {
                 cease = &mut close_rx => {
                     if let Some(Ok(msg)) = cease {
-                        urgent.insert(0, msg);
+                        rs.urgent.insert(0, msg);
                         self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                     }
                 }
-                _ = holdtime_futures.next() => {
+                _ = rs.holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
-                    let effects = self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
                     self.process_effects(effects).await;
                 }
-                _ = keepalive_futures.next() => {
+                _ = rs.keepalive_futures.next() => {
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
-                    let effects = self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
                     self.process_effects(effects).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
@@ -4269,7 +4250,7 @@ impl Connection {
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
                                     continue;
                                 }
-                                if !framer.inner().channel.contains_key(&ri.family) {
+                                if !rs.framer.inner().channel.contains_key(&ri.family) {
                                     continue;
                                 }
                                 // Filter changes that exceed this peer's effective send_max.
@@ -4294,7 +4275,7 @@ impl Connection {
                                         && ri.old_rank > 0
                                         && ri.old_rank <= effective_max
                                     {
-                                        pending_update.get_mut(&ri.family).unwrap().insert_change(
+                                        rs.pending.get_mut(&ri.family).unwrap().insert_change(
                                             table::Change {
                                                 attr: Arc::new(Vec::new()),
                                                 ..ri
@@ -4303,7 +4284,7 @@ impl Connection {
                                     }
                                     continue;
                                 }
-                                pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
+                                rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
                             }
                         }
                     }
@@ -4321,11 +4302,11 @@ impl Connection {
                                 self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                             Ok(_) => loop {
-                                    match framer.try_parse(&mut rxbuf) {
+                                    match rs.framer.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut framer, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update).await;
+                                            let _ = self.rx_msg(&mut rs, local_sockaddr, remote_sockaddr, msg).await;
                                         }
                                         None => {
                                             // partial read
@@ -4334,7 +4315,7 @@ impl Connection {
                                     }
                                     Err(e) => {
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
-                                            urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
+                                            rs.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
                                             self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
                                         } else {
                                             self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
@@ -4351,7 +4332,7 @@ impl Connection {
                     }
 
                     if ready.is_writable() {
-                        self.flush_tx(&mut stream, &mut framer, txbuf_size, &mut urgent, &mut keepalive_futures, &mut pending_update).await;
+                        self.flush_tx(&mut stream, &mut rs).await;
                     }
                 }
             }
@@ -4603,18 +4584,15 @@ mod tests {
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let effects = conn
-            .apply_outputs(
-                outputs,
-                &mut Vec::new(),
-                &mut make_framer(),
-                &mut make_timers(),
-                &mut make_timers(),
-                &mut FnvHashMap::default(),
-                dummy,
-                dummy,
-            )
-            .await;
+        let mut rs = RunState {
+            urgent: Vec::new(),
+            framer: make_framer(),
+            keepalive_futures: make_timers(),
+            holdtime_futures: make_timers(),
+            pending: FnvHashMap::default(),
+            txbuf_size: 1 << 16,
+        };
+        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(
@@ -4652,18 +4630,15 @@ mod tests {
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let effects = conn
-            .apply_outputs(
-                outputs,
-                &mut Vec::new(),
-                &mut make_framer(),
-                &mut make_timers(),
-                &mut make_timers(),
-                &mut FnvHashMap::default(),
-                dummy,
-                dummy,
-            )
-            .await;
+        let mut rs = RunState {
+            urgent: Vec::new(),
+            framer: make_framer(),
+            keepalive_futures: make_timers(),
+            holdtime_futures: make_timers(),
+            pending: FnvHashMap::default(),
+            txbuf_size: 1 << 16,
+        };
+        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
         conn.process_effects(effects).await;
 
         let received = active_close_rx
@@ -4728,18 +4703,15 @@ mod tests {
         );
 
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let effects = conn
-            .apply_outputs(
-                outputs,
-                &mut Vec::new(),
-                &mut make_framer(),
-                &mut make_timers(),
-                &mut make_timers(),
-                &mut FnvHashMap::default(),
-                dummy,
-                dummy,
-            )
-            .await;
+        let mut rs = RunState {
+            urgent: Vec::new(),
+            framer: make_framer(),
+            keepalive_futures: make_timers(),
+            holdtime_futures: make_timers(),
+            pending: FnvHashMap::default(),
+            txbuf_size: 1 << 16,
+        };
+        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
         conn.process_effects(effects).await;
 
         let received = active_close_rx
