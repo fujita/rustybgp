@@ -4546,4 +4546,127 @@ mod tests {
         let peer = g.peers.get(&remote_addr).unwrap();
         assert!(peer.config.delete_on_disconnected);
     }
+
+    fn make_framer() -> BgpFramer {
+        BgpFramer::new(
+            bgp::PeerCodecBuilder::new()
+                .local_asn(65001)
+                .local_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+                .build(),
+        )
+    }
+
+    fn make_timers() -> FuturesUnordered<tokio::time::Sleep> {
+        vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+            .into_iter()
+            .collect()
+    }
+
+    fn cease_notification() -> bgp::Message {
+        bgp::Message::Notification(packet::BgpError::Other {
+            code: 6,    // Cease
+            subcode: 7, // Connection Collision Resolution
+            data: vec![],
+        })
+    }
+
+    /// Helper: add a peer and return a passive Connection via accept_connection.
+    async fn passive_connection(
+        global: &GlobalHandle,
+        tables: &TableHandle,
+        remote_addr: IpAddr,
+        server: TcpStream,
+    ) -> Connection {
+        {
+            let mut g = global.write().await;
+            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+                .unwrap();
+        }
+        accept_connection(global, tables, server, crate::fsm::Role::Passive)
+            .await
+            .unwrap()
+    }
+
+    /// `apply_outputs` must return `GlobalEffect::SendCease` for a `SendMessage`
+    /// output targeting the other role, without touching global state.
+    #[tokio::test]
+    async fn apply_outputs_returns_send_cease_for_other_role() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+
+        let outputs = vec![crate::fsm::PeerFsmOutput::Session(
+            crate::fsm::Role::Active,
+            crate::fsm::Output::SendMessage(cease_notification()),
+        )];
+        let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
+        let effects = conn
+            .apply_outputs(
+                outputs,
+                &mut Vec::new(),
+                &mut make_framer(),
+                &mut make_timers(),
+                &mut make_timers(),
+                &mut FnvHashMap::default(),
+                dummy,
+                dummy,
+            )
+            .await;
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            GlobalEffect::SendCease {
+                role: crate::fsm::Role::Active,
+                ..
+            }
+        ));
+    }
+
+    /// `apply_outputs` + `process_effects` must deliver the CEASE message to the
+    /// losing connection's oneshot channel.
+    #[tokio::test]
+    async fn collision_cease_dispatched_to_loser() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+
+        // Simulate the losing active connection by pre-installing its close_tx.
+        let (active_close_tx, mut active_close_rx) =
+            tokio::sync::oneshot::channel::<bgp::Message>();
+        {
+            let mut g = global.write().await;
+            g.peers.get_mut(&remote_addr).unwrap().active_close_tx = CloseTx(Some(active_close_tx));
+        }
+
+        let outputs = vec![crate::fsm::PeerFsmOutput::Session(
+            crate::fsm::Role::Active,
+            crate::fsm::Output::SendMessage(cease_notification()),
+        )];
+        let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
+        let effects = conn
+            .apply_outputs(
+                outputs,
+                &mut Vec::new(),
+                &mut make_framer(),
+                &mut make_timers(),
+                &mut make_timers(),
+                &mut FnvHashMap::default(),
+                dummy,
+                dummy,
+            )
+            .await;
+        conn.process_effects(effects).await;
+
+        let received = active_close_rx
+            .try_recv()
+            .expect("CEASE not delivered to loser");
+        assert!(matches!(received, bgp::Message::Notification(_)));
+    }
 }
