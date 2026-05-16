@@ -3591,6 +3591,20 @@ fn peer_loop(
     });
 }
 
+/// Side effects from `apply_outputs` that require mutating global peer state.
+/// Returned by `apply_outputs` and processed by `process_effects` so that
+/// `apply_outputs` itself has no async global dependency and is unit-testable.
+enum GlobalEffect {
+    /// Send a CEASE Notification to the connection with the given role
+    /// (collision loser dispatch via that connection's close_tx).
+    SendCease {
+        role: crate::fsm::Role,
+        msg: bgp::Message,
+    },
+    /// Cancel the active-connect retry loop for this peer.
+    StopActiveConnect,
+}
+
 struct Connection {
     remote_addr: IpAddr,
     local_addr: IpAddr,
@@ -3803,27 +3817,15 @@ impl Connection {
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
-    ) {
+    ) -> Vec<GlobalEffect> {
+        let mut effects = Vec::new();
         for output in outputs {
             match output {
                 crate::fsm::PeerFsmOutput::Session(role, crate::fsm::Output::SendMessage(m)) => {
                     if role == self.role {
                         urgent.push(m);
                     } else {
-                        let tx = {
-                            let mut global = self.global.write().await;
-                            if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
-                                match role {
-                                    crate::fsm::Role::Active => peer.active_close_tx.0.take(),
-                                    crate::fsm::Role::Passive => peer.passive_close_tx.0.take(),
-                                }
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(tx) = tx {
-                            let _ = tx.send(m);
-                        }
+                        effects.push(GlobalEffect::SendCease { role, msg: m });
                     }
                 }
                 crate::fsm::PeerFsmOutput::Session(
@@ -3932,6 +3934,29 @@ impl Connection {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
+                    effects.push(GlobalEffect::StopActiveConnect);
+                }
+            }
+        }
+        effects
+    }
+
+    async fn process_effects(&self, effects: Vec<GlobalEffect>) {
+        for effect in effects {
+            match effect {
+                GlobalEffect::SendCease { role, msg } => {
+                    let mut global = self.global.write().await;
+                    if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
+                        let tx = match role {
+                            crate::fsm::Role::Active => peer.active_close_tx.0.take(),
+                            crate::fsm::Role::Passive => peer.passive_close_tx.0.take(),
+                        };
+                        if let Some(tx) = tx {
+                            let _ = tx.send(msg);
+                        }
+                    }
+                }
+                GlobalEffect::StopActiveConnect => {
                     let mut global = self.global.write().await;
                     if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
                         peer.active_connect_cancel_tx.0.take();
@@ -4103,17 +4128,19 @@ impl Connection {
                 crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(_))
             )
         });
-        self.apply_outputs(
-            outputs,
-            urgent,
-            framer,
-            keepalive_futures,
-            holdtime_futures,
-            pending,
-            local_sockaddr,
-            remote_sockaddr,
-        )
-        .await;
+        let effects = self
+            .apply_outputs(
+                outputs,
+                urgent,
+                framer,
+                keepalive_futures,
+                holdtime_futures,
+                pending,
+                local_sockaddr,
+                remote_sockaddr,
+            )
+            .await;
+        self.process_effects(effects).await;
 
         // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
@@ -4180,17 +4207,19 @@ impl Connection {
             .lock()
             .unwrap()
             .process(self.role, crate::fsm::Input::Connected);
-        self.apply_outputs(
-            outputs,
-            &mut urgent,
-            &mut framer,
-            &mut keepalive_futures,
-            &mut holdtime_futures,
-            &mut pending_update,
-            local_sockaddr,
-            remote_sockaddr,
-        )
-        .await;
+        let effects = self
+            .apply_outputs(
+                outputs,
+                &mut urgent,
+                &mut framer,
+                &mut keepalive_futures,
+                &mut holdtime_futures,
+                &mut pending_update,
+                local_sockaddr,
+                remote_sockaddr,
+            )
+            .await;
+        self.process_effects(effects).await;
 
         let mut close_rx: futures::future::OptionFuture<_> =
             self.close_rx.take().map(|rx| rx.fuse()).into();
@@ -4222,11 +4251,13 @@ impl Connection {
                 _ = holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
-                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    self.process_effects(effects).await;
                 }
                 _ = keepalive_futures.next() => {
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
-                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, &mut urgent, &mut framer, &mut keepalive_futures, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    self.process_effects(effects).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
