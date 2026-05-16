@@ -3561,25 +3561,28 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
     })
 }
 
+struct DisconnectInfo {
+    role: crate::fsm::Role,
+    remote_addr: IpAddr,
+}
+
 fn peer_loop(
     mut h: Connection,
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
     tokio::spawn(async move {
-        let peer_addr = h.remote_addr;
-        let role = h.role;
-        let _ = h.run().await;
+        let info = h.run().await;
         let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&peer_addr) {
-            match role {
+        if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
+            match info.role {
                 crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
                 crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
             }
             // Only reset and reconnect when no Connection remains for this peer.
             if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
                 if peer.config.delete_on_disconnected {
-                    server.peers.remove(&peer_addr);
+                    server.peers.remove(&info.remote_addr);
                 } else {
                     peer.reset();
                     enable_active_connect(peer, active_conn_tx);
@@ -4147,10 +4150,18 @@ impl Connection {
         Ok(())
     }
 
-    async fn run(&mut self) -> Result<(), Error> {
+    async fn run(&mut self) -> DisconnectInfo {
+        let disconnect = DisconnectInfo {
+            role: self.role,
+            remote_addr: self.remote_addr,
+        };
         let mut stream = self.stream.take().unwrap();
-        let remote_sockaddr = stream.peer_addr()?;
-        let local_sockaddr = stream.local_addr()?;
+        let Ok(remote_sockaddr) = stream.peer_addr() else {
+            return disconnect;
+        };
+        let Ok(local_sockaddr) = stream.local_addr() else {
+            return disconnect;
+        };
         let rxbuf_size = 1 << 16;
         let mut txbuf_size = 1 << 16;
         if let Ok(r) =
@@ -4374,7 +4385,7 @@ impl Connection {
                 }
             }
         }
-        Ok(())
+        disconnect
     }
 }
 
