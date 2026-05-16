@@ -3210,14 +3210,14 @@ impl Global {
                     if let Some(Some(Ok(stream))) = stream
                         && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
                     {
-                        peer_loop(h, global.clone(), active_tx.clone());
+                        tokio::spawn(peer_loop(h, global.clone(), active_tx.clone()));
                     }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
                         && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
                     {
-                        peer_loop(h, global.clone(), active_tx.clone());
+                        tokio::spawn(peer_loop(h, global.clone(), active_tx.clone()));
                     }
                 }
             }
@@ -3566,30 +3566,28 @@ struct DisconnectInfo {
     remote_addr: IpAddr,
 }
 
-fn peer_loop(
+async fn peer_loop(
     mut h: Connection,
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
-    tokio::spawn(async move {
-        let info = h.run().await;
-        let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
-            match info.role {
-                crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
-                crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
-            }
-            // Only reset and reconnect when no Connection remains for this peer.
-            if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
-                if peer.config.delete_on_disconnected {
-                    server.peers.remove(&info.remote_addr);
-                } else {
-                    peer.reset();
-                    enable_active_connect(peer, active_conn_tx);
-                }
+    let info = h.run().await;
+    let mut server = global.write().await;
+    if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
+        match info.role {
+            crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
+            crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
+        }
+        // Only reset and reconnect when no Connection remains for this peer.
+        if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
+            if peer.config.delete_on_disconnected {
+                server.peers.remove(&info.remote_addr);
+            } else {
+                peer.reset();
+                enable_active_connect(peer, active_conn_tx);
             }
         }
-    });
+    }
 }
 
 /// Side effects from `apply_outputs` that require mutating global peer state.
