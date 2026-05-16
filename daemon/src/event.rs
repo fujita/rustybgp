@@ -4630,6 +4630,8 @@ mod tests {
     /// losing connection's oneshot channel.
     #[tokio::test]
     async fn collision_cease_dispatched_to_loser() {
+        // NOTE: outputs are hand-crafted; router-ID comparison is NOT exercised here.
+        // See collision_loser_determined_by_router_id for end-to-end coverage.
         let global = make_global();
         let tables = make_tables();
         let (client, server) = loopback_pair().await;
@@ -4667,6 +4669,82 @@ mod tests {
         let received = active_close_rx
             .try_recv()
             .expect("CEASE not delivered to loser");
+        assert!(matches!(received, bgp::Message::Notification(_)));
+    }
+
+    /// End-to-end collision test: the loser is determined by real router-ID comparison
+    /// inside `PeerFsm::check_collision`, not by hand-crafted outputs.
+    ///
+    /// make_global() sets local router_id = 1.0.0.1.
+    /// Remote router_id = 10.0.0.1 (higher) → passive wins → active is the loser.
+    #[tokio::test]
+    async fn collision_loser_determined_by_router_id() {
+        let global = make_global(); // local router_id = 1.0.0.1
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+
+        // Pre-install active_close_tx so process_effects can deliver to it.
+        let (active_close_tx, mut active_close_rx) =
+            tokio::sync::oneshot::channel::<bgp::Message>();
+        {
+            let mut g = global.write().await;
+            g.peers.get_mut(&remote_addr).unwrap().active_close_tx = CloseTx(Some(active_close_tx));
+        }
+
+        // remote router_id 10.0.0.1 > local 1.0.0.1 → passive wins → active is loser
+        let open_msg = bgp::Message::Open(bgp::Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            capability: vec![],
+        });
+
+        let peer_fsm = {
+            let g = global.read().await;
+            Arc::clone(g.peers[&remote_addr].peer_fsm.as_ref().unwrap())
+        };
+
+        // Active → OpenConfirm
+        peer_fsm
+            .lock()
+            .unwrap()
+            .process(crate::fsm::Role::Active, crate::fsm::Input::Connected);
+        peer_fsm.lock().unwrap().process(
+            crate::fsm::Role::Active,
+            crate::fsm::Input::MessageReceived(open_msg.clone()),
+        );
+
+        // Passive → OpenConfirm → collision detected → outputs include SendMessage to Active
+        peer_fsm
+            .lock()
+            .unwrap()
+            .process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+        let outputs = peer_fsm.lock().unwrap().process(
+            crate::fsm::Role::Passive,
+            crate::fsm::Input::MessageReceived(open_msg),
+        );
+
+        let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
+        let effects = conn
+            .apply_outputs(
+                outputs,
+                &mut Vec::new(),
+                &mut make_framer(),
+                &mut make_timers(),
+                &mut make_timers(),
+                &mut FnvHashMap::default(),
+                dummy,
+                dummy,
+            )
+            .await;
+        conn.process_effects(effects).await;
+
+        let received = active_close_rx
+            .try_recv()
+            .expect("CEASE not delivered to active (loser)");
         assert!(matches!(received, bgp::Message::Notification(_)));
     }
 }
